@@ -18,28 +18,52 @@ in
   ];
 
   boot = {
-    # kernel >7.2-rc1 where ism was rewritten
-    kernelPackages = lib.mkIf (lib.versionOlder pkgs.linux.version "7.2") pkgs.linuxPackages_testing;
+    # kernel >7.2-rc1 where ism was rewritten. Additionally pinned to a
+    # mainline snapshot past 7.2-rc3 for the rc4-bound DCN display fixes
+    # (8382cd234981 "consolidate DCN vblank/flip handling onto
+    # vupdate_no_lock", 48ab86360af1 "check GRPH_FLIP status before sending
+    # event"); drop the snapshot pin once linuxPackages_testing >= 7.2-rc4.
+    kernelPackages = lib.mkIf (lib.versionOlder pkgs.linux.version "7.2") (
+      if lib.versionOlder pkgs.linux_testing.version "7.2-rc4" then
+        pkgs.linuxPackagesFor (
+          pkgs.linux_testing.override {
+            argsOverride = {
+              version = "7.2-rc3";
+              modDirVersion = "7.2.0-rc3";
+              src = pkgs.fetchFromGitHub {
+                owner = "torvalds";
+                repo = "linux";
+                rev = "f2ec6312bf711369561bdcb22f8a63c0b118c479";
+                hash = "sha256-Ia6+cjsq6B5C+U611JaUgw6zT49CUwf4Mni+c3KqWmM=";
+              };
+            };
+          }
+        )
+      else
+        pkgs.linuxPackages_testing
+    );
     kernelModules = [ "kvm-amd" ];
     kernelParams = [
       "pcie_aspm.policy=powersupersave"
-      "amdgpu.dcdebugmask=0x410" # 0x10 = disable PSR, 0x400 = disable panel replay
     ];
   };
 
   # linux-firmware pinned past the 20260622 release for the DMCUB
-  # 0.1.65.0 update (e3e36153, 2026-06-26, includes dcn_3_5_1)
+  # 0.1.67.0 update (1168e26f, 2026-07-17, includes dcn_3_5_1; its "improve
+  # lock mechanism with HW lock mgr" change touches the DCN35 IPS entry/exit
+  # path). The first release containing it will be dated >= 20260717, at
+  # which point this pin stands down.
   nixpkgs.overlays = [
     (final: prev: {
       linux-firmware =
-        if lib.versionOlder prev.linux-firmware.version "20260626" then
+        if lib.versionOlder prev.linux-firmware.version "20260717" then
           prev.linux-firmware.overrideAttrs {
-            version = "20260622-unstable-2026-06-26";
+            version = "20260622-unstable-2026-07-17";
             src = final.fetchFromGitLab {
               owner = "kernel-firmware";
               repo = "linux-firmware";
-              rev = "e3e36153ce3fff3f9c063dec7c267ce676a00a50";
-              hash = "sha256-XtTS975qrdABk0xCnisBgCEGvCIRzkoupsimXXGSuBQ=";
+              rev = "1168e26f77312e0f55a763891fb57b66d405b5f3";
+              hash = "sha256-hcIHJWjlsrWaAPPOYhYkpgM3N2v+u+ZDzzpnOmaLdVc=";
             };
           }
         else
