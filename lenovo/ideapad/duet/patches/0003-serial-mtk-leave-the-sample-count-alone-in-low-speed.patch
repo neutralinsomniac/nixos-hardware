@@ -1,0 +1,42 @@
+From 2ffa839380c052e14c3c6045807134c53ff53744 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:05:53 +0200
+Subject: [PATCH 03/21] serial: mtk: leave the sample count alone in low-speed
+ mode
+
+In low speed mode the sample count is fixed to 16 and the sample point
+and fraction registers are meaningless.  Leave them at the values the
+boot firmware programmed (the same thing the coreboot 8250 driver does)
+instead of writing a zero sample count, which breaks the bit rate
+generator and garbles the output on boards the firmware already set up.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ drivers/serial/serial_mtk.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/serial/serial_mtk.c b/drivers/serial/serial_mtk.c
+index 01cc415efdd..4aaae5f621f 100644
+--- a/drivers/serial/serial_mtk.c
++++ b/drivers/serial/serial_mtk.c
+@@ -171,6 +171,17 @@ set_baud:
+ 	writel((quot >> 8) & 0xff, &priv->regs->dlm);
+ 	writel(UART_LCR_WLS_8, &priv->regs->lcr);
+ 
++	/*
++	 * In low speed mode the sample count is fixed to 16 and the
++	 * sample point and fraction registers are meaningless.  Leave
++	 * them at the values the boot firmware programmed (the same
++	 * thing the coreboot 8250 driver does) instead of writing a
++	 * zero sample count, which breaks the bit rate generator and
++	 * garbles the output on boards the firmware already set up.
++	 */
++	if (samplecount <= 1)
++		return;
++
+ 	/* set highspeed mode sample count & point */
+ 	writel(samplecount - 1, &priv->regs->sample_count);
+ 	writel((samplecount >> 1) - 1, &priv->regs->sample_point);
+-- 
+2.53.0
+

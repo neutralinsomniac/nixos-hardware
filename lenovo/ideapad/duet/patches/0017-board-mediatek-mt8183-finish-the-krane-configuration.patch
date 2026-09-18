@@ -1,0 +1,81 @@
+From c4f4b804066a7c6ab659e2f717fd82ceaaddac86 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:22:04 +0200
+Subject: [PATCH 17/21] board: mediatek: mt8183: finish the krane configuration
+ for EFI boot
+
+Complete the krane (Lenovo IdeaPad Duet) defconfig and default
+environment for the intended EFI -> GRUB -> Linux boot flow, and for
+the display bring-up of the previous patches:
+
+- CONFIG_BOOTCOMMAND="bootefi bootmgr": the board has no persistent
+  storage for U-Boot env variables (ENV_IS_NOWHERE), so the EFI boot
+  manager boots the entries found on the ESP and falls back to the
+  /EFI/BOOT/BOOTAA64.EFI removable path, both present on this target.
+  distro_bootcmd would only add scan delays.  Keep a 2 s bootdelay so
+  the prompt stays reachable over serial.
+
+- Enable EFI_LOADER (explicitly disabled before) and fix the display
+  driver selection: VIDEO_MT8183_DISPLAY depends on VIDEO_MIPI_DSI &&
+  PANEL && PHY, which the defconfig never set, so a regenerated config
+  silently dropped the cold bring-up driver and fell back to the
+  (since removed) scanout choice default.  Set CONFIG_VIDEO_MIPI_DSI=y
+  and select the driver explicitly so the committed defconfig is
+  self-sufficient.  Drop the VIDEO_MT8183_SCANOUT line, whose driver
+  no longer exists.
+
+- Route the console through the vidconsole (stdout/stderr =
+  serial,vidconsole; stdin = serial,usbkbd) in krane.env: the default
+  environment must work with ENV_IS_NOWHERE at the payload stage.
+
+- CONFIG_USE_PREBOOT=y so the "usb start" default (with USB_KEYBOARD)
+  enumerates the pogo keyboard before the prompt; enable the USB stack
+  (USB, DM_USB, USB_XHCI_HCD, USB_XHCI_MTK, USB_STORAGE, CMD_USB), the
+  MTK T-PHY, USB_KEYBOARD and CMD_USB_MASS_STORAGE for the pogo
+  keyboard and USB sticks.
+
+- Cut CONFIG_USB_HUB_DEBOUNCE_TIMEOUT to 200 ms: with two hubs on the
+  pogo bus, the stock 1000 ms adds ~2.2 s of dead wait for empty hub
+  ports before the countdown can start.  Debounce only needs to cover
+  the settle time of devices power-cycled by the scan itself; the
+  pogo keyboard and its GL610 hub are powered from cold boot, so 200
+  ms is ample.
+
+- CONFIG_CONSOLE_ROTATION with video rot=1: the BOE TV101WUM-NL6
+  panel is mounted rotated 270 degrees in the krane chassis (rotation
+  property of the panel node in the upstream DT); the uclass binds the
+  rotated vidconsole driver, which writes glyphs rotated by 90 degrees
+  clockwise into the native 1200x1920 portrait scanout.  The
+  framebuffer geometry and the depthcharge scanout path are unchanged.
+
+- CONFIG_VIDEO_DAMAGE: with the display enabled, every console
+  character went through video_sync() -> video_flush_dcache(),
+  flushing the entire 1200x1920x32 (9.2 MiB) framebuffer (~144k
+  cacheline maintenance ops per output character).  Dirty-rect
+  tracking reduces a single typed character to one glyph region.
+
+- CONFIG_TEXT_BASE=0x4C001000: 8-aligned image base.
+
+- CONFIG_MT8183_SMP_PARK / park-mode residue removal, the 16x32
+  console font made durable in the defconfig, and
+  MTK_MEM_MAP_DDR_SIZE=0x100000000 so relocation can target the full
+  4 GiB the SoC init now reports.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ board/mediatek/mt8183/krane.env | 3 +++
+ 1 file changed, 3 insertions(+)
+ create mode 100644 board/mediatek/mt8183/krane.env
+
+diff --git a/board/mediatek/mt8183/krane.env b/board/mediatek/mt8183/krane.env
+new file mode 100644
+index 00000000000..e9e8bd4ecbe
+--- /dev/null
++++ b/board/mediatek/mt8183/krane.env
+@@ -0,0 +1,3 @@
++stdin=serial,usbkbd
++stdout=serial,vidconsole
++stderr=serial,vidconsole
+-- 
+2.53.0
+

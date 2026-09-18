@@ -1,0 +1,195 @@
+From 78ba6a2d7fec256960a5f80137ca949d367c9fe3 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:08:00 +0200
+Subject: [PATCH 08/21] clk: mediatek: mt8183: add MMSYS display clock gates
+
+The MT8183 clock driver only models the topckgen, apmixedsys and
+infracfg clock controllers; the MMSYS display gates (OVL0, OVL0_2L,
+RDMA0, COLOR0, DSI0 engine/interface and friends) had no provider, so
+display drivers could not enable the clocks described in the device
+tree 'mmsys' node (mediatek,mt8183-mmsys with #clock-cells = <1>).
+
+Add the two gate register groups (CG_CON0 at 0x100 and CG_CON1 at
+0x110, with set/clr registers at +4/+8) and the complete gate list
+ported from the Linux kernel driver drivers/clk/mediatek/
+clk-mt8183-mm.c.  All gates are children of the MM or DPI0 topckgen
+muxes (or the 26M fixed clock).
+
+The gate arrays follow the register bit order of each clock domain,
+while the device tree uses the clock IDs of the legacy clock header;
+the two do not agree everywhere.  Provide the DT clock ID to gate
+array-position maps for the infracfg and mmsys trees through the
+existing .id_offs_map mechanism.
+
+This is a prerequisite for bringing the MT8183 display pipeline up
+from scratch instead of relying on the boot firmware having left the
+display clocks enabled.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ drivers/clk/mediatek/clk-mt8183.c | 138 ++++++++++++++++++++++++++++++
+ 1 file changed, 138 insertions(+)
+
+diff --git a/drivers/clk/mediatek/clk-mt8183.c b/drivers/clk/mediatek/clk-mt8183.c
+index 5a4863049c5..12a74da66ab 100644
+--- a/drivers/clk/mediatek/clk-mt8183.c
++++ b/drivers/clk/mediatek/clk-mt8183.c
+@@ -787,13 +787,133 @@ static const struct mtk_gate infra_clks[] = {
+ 	GATE_INFRA3(CLK_INFRA_FBIST2FPC, CLK_TOP_MUX_MSDC50_0, 24),
+ };
+ 
++/*
++ * The gate arrays follow the register bit order of each clock domain,
++ * while the device tree uses the clock IDs of the legacy clock header;
++ * the two do not agree everywhere.  Map each DT clock ID to its array
++ * position; -1 marks IDs that have no gate.
++ */
++static const int mt8183_id_infra_offs_map[] = {
++	0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
++	10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
++	20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
++	30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
++	40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
++	50, 52, 53, 55, 56, 57, 58, 59, 60, 61,
++	62, 63, 64, 65, 66, -1, 67, -1, 68, 69,
++	70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
++	80, 81, 82, 83, -1, -1, 84, 85, 86, 87,
++	54, 51, 88, 89, 90, 91, 92, 93, 94, 95,
++	96,
++};
++
++static const int mt8183_id_mm_offs_map[] = {
++	0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
++	10, 11, 12, 13, 14, 15, 16, 17, 19, 20,
++	21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
++	31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
++	41, 18, 42, 43, 44, 45,
++};
++
+ static const struct mtk_clk_tree mt8183_infracfg_tree = {
+ 	.ext_clk_rates = ext_clock_rates,
+ 	.num_ext_clks = ARRAY_SIZE(ext_clock_rates),
++	.id_offs_map = mt8183_id_infra_offs_map,
++	.id_offs_map_size = ARRAY_SIZE(mt8183_id_infra_offs_map),
+ 	.gates = infra_clks,
+ 	.num_gates = ARRAY_SIZE(infra_clks),
+ };
+ 
++static const struct mtk_gate_regs mm0_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs mm1_cg_regs = {
++	.set_ofs = 0x114,
++	.clr_ofs = 0x118,
++	.sta_ofs = 0x110,
++};
++
++#define GATE_MM0(_id, _parent, _shift) {			\
++		.id = _id,					\
++		.parent = _parent,				\
++		.regs = &mm0_cg_regs,				\
++		.shift = _shift,				\
++		.flags = CLK_GATE_SETCLR | CLK_PARENT_TOPCKGEN,	\
++	}
++
++#define GATE_MM1(_id, _parent, _shift) {			\
++		.id = _id,					\
++		.parent = _parent,				\
++		.regs = &mm1_cg_regs,				\
++		.shift = _shift,				\
++		.flags = CLK_GATE_SETCLR | CLK_PARENT_TOPCKGEN,	\
++	}
++
++/*
++ * MMSYS display gates. Gate bits and their grouping into CG_CON0/CG_CON1
++ * match the Linux kernel driver drivers/clk/mediatek/clk-mt8183-mm.c.
++ */
++static const struct mtk_gate mm_clks[] = {
++	/* MM0 */
++	GATE_MM0(CLK_MM_SMI_COMMON, CLK_TOP_MUX_MM, 0),
++	GATE_MM0(CLK_MM_SMI_LARB0, CLK_TOP_MUX_MM, 1),
++	GATE_MM0(CLK_MM_SMI_LARB1, CLK_TOP_MUX_MM, 2),
++	GATE_MM0(CLK_MM_GALS_COMM0, CLK_TOP_MUX_MM, 3),
++	GATE_MM0(CLK_MM_GALS_COMM1, CLK_TOP_MUX_MM, 4),
++	GATE_MM0(CLK_MM_GALS_CCU2MM, CLK_TOP_MUX_MM, 5),
++	GATE_MM0(CLK_MM_GALS_IPU12MM, CLK_TOP_MUX_MM, 6),
++	GATE_MM0(CLK_MM_GALS_IMG2MM, CLK_TOP_MUX_MM, 7),
++	GATE_MM0(CLK_MM_GALS_CAM2MM, CLK_TOP_MUX_MM, 8),
++	GATE_MM0(CLK_MM_GALS_IPU2MM, CLK_TOP_MUX_MM, 9),
++	GATE_MM0(CLK_MM_MDP_DL_TXCK, CLK_TOP_MUX_MM, 10),
++	GATE_MM0(CLK_MM_IPU_DL_TXCK, CLK_TOP_MUX_MM, 11),
++	GATE_MM0(CLK_MM_MDP_RDMA0, CLK_TOP_MUX_MM, 12),
++	GATE_MM0(CLK_MM_MDP_RDMA1, CLK_TOP_MUX_MM, 13),
++	GATE_MM0(CLK_MM_MDP_RSZ0, CLK_TOP_MUX_MM, 14),
++	GATE_MM0(CLK_MM_MDP_RSZ1, CLK_TOP_MUX_MM, 15),
++	GATE_MM0(CLK_MM_MDP_TDSHP, CLK_TOP_MUX_MM, 16),
++	GATE_MM0(CLK_MM_MDP_WROT0, CLK_TOP_MUX_MM, 17),
++	GATE_MM0(CLK_MM_MDP_WDMA0, CLK_TOP_MUX_MM, 18),
++	GATE_MM0(CLK_MM_FAKE_ENG, CLK_TOP_MUX_MM, 19),
++	GATE_MM0(CLK_MM_DISP_OVL0, CLK_TOP_MUX_MM, 20),
++	GATE_MM0(CLK_MM_DISP_OVL0_2L, CLK_TOP_MUX_MM, 21),
++	GATE_MM0(CLK_MM_DISP_OVL1_2L, CLK_TOP_MUX_MM, 22),
++	GATE_MM0(CLK_MM_DISP_RDMA0, CLK_TOP_MUX_MM, 23),
++	GATE_MM0(CLK_MM_DISP_RDMA1, CLK_TOP_MUX_MM, 24),
++	GATE_MM0(CLK_MM_DISP_WDMA0, CLK_TOP_MUX_MM, 25),
++	GATE_MM0(CLK_MM_DISP_COLOR0, CLK_TOP_MUX_MM, 26),
++	GATE_MM0(CLK_MM_DISP_CCORR0, CLK_TOP_MUX_MM, 27),
++	GATE_MM0(CLK_MM_DISP_AAL0, CLK_TOP_MUX_MM, 28),
++	GATE_MM0(CLK_MM_DISP_GAMMA0, CLK_TOP_MUX_MM, 29),
++	GATE_MM0(CLK_MM_DISP_DITHER0, CLK_TOP_MUX_MM, 30),
++	GATE_MM0(CLK_MM_DISP_SPLIT, CLK_TOP_MUX_MM, 31),
++	/* MM1 */
++	GATE_MM1(CLK_MM_DSI0_MM, CLK_TOP_MUX_MM, 0),
++	GATE_MM1(CLK_MM_DSI0_IF, CLK_TOP_MUX_MM, 1),
++	GATE_MM1(CLK_MM_DPI_MM, CLK_TOP_MUX_MM, 2),
++	GATE_MM1(CLK_MM_DPI_IF, CLK_TOP_MUX_DPI0, 3),
++	GATE_MM1(CLK_MM_FAKE_ENG2, CLK_TOP_MUX_MM, 4),
++	GATE_MM1(CLK_MM_MDP_DL_RX, CLK_TOP_MUX_MM, 5),
++	GATE_MM1(CLK_MM_IPU_DL_RX, CLK_TOP_MUX_MM, 6),
++	GATE_MM1(CLK_MM_26M, CLK_TOP_F26M_CK_D2, 7),
++	GATE_MM1(CLK_MM_MMSYS_R2Y, CLK_TOP_MUX_MM, 8),
++	GATE_MM1(CLK_MM_DISP_RSZ, CLK_TOP_MUX_MM, 9),
++	GATE_MM1(CLK_MM_MDP_AAL, CLK_TOP_MUX_MM, 10),
++	GATE_MM1(CLK_MM_MDP_CCORR, CLK_TOP_MUX_MM, 11),
++	GATE_MM1(CLK_MM_DBI_MM, CLK_TOP_MUX_MM, 12),
++	GATE_MM1(CLK_MM_DBI_IF, CLK_TOP_MUX_DPI0, 13),
++};
++
++static const struct mtk_clk_tree mt8183_mmsys_tree = {
++	.id_offs_map = mt8183_id_mm_offs_map,
++	.id_offs_map_size = ARRAY_SIZE(mt8183_id_mm_offs_map),
++	.gates = mm_clks,
++	.num_gates = ARRAY_SIZE(mm_clks),
++};
++
+ static const struct udevice_id mt8183_apmixed_compat[] = {
+ 	{
+ 		.compatible = "mediatek,mt8183-apmixedsys",
+@@ -847,3 +967,21 @@ U_BOOT_DRIVER(mt8183_clk_infracfg) = {
+ 	.ops = &mtk_clk_topckgen_ops,
+ 	.flags = DM_FLAG_PRE_RELOC,
+ };
++
++static const struct udevice_id mt8183_mmsys_compat[] = {
++	{
++		.compatible = "mediatek,mt8183-mmsys",
++		.data = (ulong)&mt8183_mmsys_tree,
++	},
++	{ }
++};
++
++U_BOOT_DRIVER(mt8183_clk_mmsys) = {
++	.name = "mt8183-mmsys",
++	.id = UCLASS_CLK,
++	.of_match = mt8183_mmsys_compat,
++	.probe = mtk_clk_probe,
++	.priv_auto = sizeof(struct mtk_clk_priv),
++	.ops = &mtk_clk_topckgen_ops,
++	.flags = DM_FLAG_PRE_RELOC,
++};
+-- 
+2.53.0
+

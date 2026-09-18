@@ -1,0 +1,73 @@
+From f38c9cdf426d581369cf50d9be8067939c67e459 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:06:10 +0200
+Subject: [PATCH 06/21] efi: console: re-sync the vidconsole cursor and accept
+ stdout lists
+
+Three console-size/output fixes for the EFI simple text output on a
+vidconsole:
+
+- Output printed by U-Boot itself moves the video console cursor
+  without updating the position tracked for EFI.  Re-sync the console
+  cursor before printing so text appears where the EFI spec places it.
+
+- query_vidconsole() matched the stdout environment value with a
+  strncmp against "vidconsole", but stdout may be a comma-separated
+  list (e.g. "serial,vidconsole"); match the substring instead.
+
+- EFI applications expect output to start at the top left of the
+  screen, while the U-Boot prompt may have left the cursor anywhere:
+  home the cursor in efi_setup_console_size().
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ lib/efi_loader/efi_console.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/lib/efi_loader/efi_console.c b/lib/efi_loader/efi_console.c
+index 8d076058280..631847db7fe 100644
+--- a/lib/efi_loader/efi_console.c
++++ b/lib/efi_loader/efi_console.c
+@@ -194,6 +194,14 @@ static efi_status_t EFIAPI efi_cout_output_string(
+ 	}
+ 	pos = buf;
+ 	utf16_utf8_strcpy(&pos, string);
++	/*
++	 * Output printed by U-Boot itself moves the video console cursor
++	 * without updating the position tracked for EFI. Re-sync the console
++	 * cursor before printing so text appears where the EFI spec places it.
++	 */
++	if (IS_ENABLED(CONFIG_VIDEO))
++		printf(ESC "[%d;%dH", (int)con->cursor_row + 1,
++		       (int)con->cursor_column + 1);
+ 	puts(buf);
+ 	free(buf);
+ 
+@@ -344,7 +352,8 @@ static int __maybe_unused query_vidconsole(int *rows, int *cols)
+ 	struct udevice *dev;
+ 	struct vidconsole_priv *priv;
+ 
+-	if (!stdout_name || strncmp(stdout_name, "vidconsole", 10))
++	/* stdout may be a comma-separated list, e.g. "serial,vidconsole" */
++	if (!stdout_name || !strstr(stdout_name, "vidconsole"))
+ 		return -ENODEV;
+ 	stdout_dev = stdio_get_by_name("vidconsole");
+ 	if (!stdout_dev)
+@@ -399,6 +408,14 @@ void efi_setup_console_size(void)
+ 		efi_con_mode.max_mode = EFI_MAX_COUT_MODE;
+ 		efi_con_mode.mode = EFI_COUT_MODE_2;
+ 	}
++
++	/*
++	 * EFI applications expect output to start at the top left of the
++	 * screen, while the U-Boot prompt may have left the cursor anywhere.
++	 */
++	printf(ESC "[1;1H");
++	efi_con_mode.cursor_column = 0;
++	efi_con_mode.cursor_row = 0;
+ }
+ 
+ /**
+-- 
+2.53.0
+

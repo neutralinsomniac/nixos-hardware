@@ -1,0 +1,523 @@
+From 9802576209374bbdcdc7dc6379a9e10912c9094a Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:20:37 +0200
+Subject: [PATCH 15/21] arm: mediatek: mt8183: decode the previous bootloader's
+ DRAM map
+
+dram_init() reduced DRAM to a scalar base + size pair taken from the
+control FDT (fdtdec_setup_mem_size_base()), which hardcodes 2 GiB for
+all of kukui, and the weak default dram_init_banksize() turned that
+into one contiguous bank.  On krane the boot chain is coreboot +
+depthcharge, which own the real map -- 4 GiB of DRAM with regions
+carved out for the firmware -- and none of that shape reached LMB and
+the EFI memory map: every byte of the covered span was published as
+conventional memory, carve-outs included.
+
+The most damaging carve-out is the ARM Trusted Firmware TZRAM at
+0x54600000: TF-A places BL31 there (plat/mediatek/mt8183 platform_def.h
+TZRAM_BASE) and coreboot, which loads it, drops the 1 MiB region from
+the memory it reports.  A kernel booted through U-Boot's EFI loader
+instead reported the region as System RAM:
+
+  52900000-bf5fffff : System RAM    <- via U-Boot: the hole is gone
+  52900000-545fffff : System RAM    <- via depthcharge: 0x54600000 is
+  54700000-...      : System RAM       absent from the map
+
+Nothing touches it while the system idles (the kernel, its initrd and
+its page tables land elsewhere), but stressapptest -M 3072 writes the
+whole 3 GiB within seconds of starting and reaches the region: the
+non-secure write takes an external abort, or corrupts the resident
+BL31, whose next PSCI call (cpuidle, CPU hotplug) then wedges EL3.
+Either way the machine silently hangs moments after stressapptest
+prints "Starting SAT".
+
+Fix the shape: decode the boot chain's map into gd->dram[] banks, one
+bank per usable range, so LMB and the EFI memory map reproduce the same
+holes instead of flattening them.
+
+The ranges come from the coreboot tables, which are the authoritative
+source: coreboot loaded BL31 and reserved the SCP and CBMEM regions,
+maintains the tables in DRAM for the payload, and depthcharge's
+/memory is itself just a copy of them.  The altfw payload ABI passes
+the tables in x0; on the vboot kernel path they are found at the fixed
+CBMEM address 0xffed9000.  The handoff FDT decode
+(fdtdec_decode_ram_size() over /memory) is kept as a last-resort
+fallback for previous bootloaders that only implement the Linux boot
+ABI -- and must not be preferred: on the shipping depthcharge its
+/memory reg reads back corrupt (a zero-size first range followed by
+nonsensical ones) even though the FDT header validates, while the
+tables read back reliably.
+
+dram_init_banksize() keeps the decoded map; without one (control FDT
+only, or no previous bootloader implementing either ABI) it falls back
+to the default single contiguous bank.  CONFIG_NR_DRAM_BANKS grows
+1 -> 8 to hold the ranges.  The boot log prints the source and the
+decoded bank list, so a wrong map is visible instead of silent.
+
+gd->ram_size stays the sum of the usable ranges, so the reported total
+and the board_get_usable_ram_top() msdc 32-bit cap are unchanged.  The
+carve-outs then simply do not exist in LMB or in the EFI memory map,
+the same way they do not exist in the map depthcharge hands a kernel,
+so the kernel sees them as the depthcharge boot does.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ arch/arm/lib/save_prev_bl_data.c     |  15 +-
+ arch/arm/mach-mediatek/mt8183/init.c | 295 ++++++++++++++++++++++++++-
+ configs/mt8183_kukui_krane_defconfig |  43 +++-
+ 3 files changed, 337 insertions(+), 16 deletions(-)
+
+diff --git a/arch/arm/lib/save_prev_bl_data.c b/arch/arm/lib/save_prev_bl_data.c
+index 4357acaef6c..0dadd362227 100644
+--- a/arch/arm/lib/save_prev_bl_data.c
++++ b/arch/arm/lib/save_prev_bl_data.c
+@@ -7,6 +7,7 @@
+  */
+ #include <init.h>
+ #include <env.h>
++#include <linux/libfdt.h>
+ #include <fdtdec.h>
+ #include <fdt_support.h>
+ #include <fdt.h>
+@@ -58,11 +59,17 @@ int save_prev_bl_data(void)
+ 	if (!is_addr_accessible((phys_addr_t)reg0))
+ 		return -ENODATA;
+ 
+-	fdt_blob = (struct fdt_header *)reg0;
+-	if (!fdt_valid(&fdt_blob)) {
+-		pr_warn("%s: address 0x%lx is not a valid fdt\n", __func__, reg0);
++	/*
++	 * The address in x0 is only guaranteed to be an FDT when the previous
++	 * bootloader implements the Linux boot ABI. Coreboot passes its
++	 * coreboot tables to payloads (src/lib/selfboot.c:
++	 * prog_set_entry(payload, entry, cbmem_find(CBMEM_ID_CBTABLE))) and
++	 * depthcharge forwards those to altfw payloads, so a non-FDT x0 is
++	 * expected there: fail quietly instead of printing a confusing
++	 * libfdt error.
++	 */
++	if (fdt_check_header(fdt_blob))
+ 		return -ENODATA;
+-	}
+ 
+ 	if (IS_ENABLED(CONFIG_SAVE_PREV_BL_FDT_ADDR))
+ 		env_set_addr("prevbl_fdt_addr", (void *)reg0);
+diff --git a/arch/arm/mach-mediatek/mt8183/init.c b/arch/arm/mach-mediatek/mt8183/init.c
+index 6cb7c742ee4..ac14b4b3272 100644
+--- a/arch/arm/mach-mediatek/mt8183/init.c
++++ b/arch/arm/mach-mediatek/mt8183/init.c
+@@ -5,8 +5,9 @@
+  * Author: Fabien Parent <fparent@baylibre.com>
+  */
+ #include <clk.h>
+-#include <dm.h>
++#include <string.h>
+ #include <fdtdec.h>
++#include <init.h>
+ #include <ram.h>
+ #include <wdt.h>
+ #include <asm/arch/misc.h>
+@@ -16,12 +17,287 @@
+ #include <asm/u-boot.h>
+ #include <dm/uclass.h>
+ #include <dt-bindings/clock/mt8516-clk.h>
++#include <linux/types.h>
++#include <asm/io.h>
++#include <cpu_func.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
++/*
++ * Print the decoded bank list.  dram_init() leaves gd->dram[] zeroed
++ * unless it decoded a shaped map from the previous bootloader, so the
++ * list ends at the first zero-size bank.
++ *
++ * This runs before relocation: .bss overlays .rela.dyn until the dynamic
++ * relocations have been applied (see u-boot.lds), so no file-scope
++ * variable may be written or relied upon here -- the decoded map lives
++ * in gd->dram[] only.
++ */
++static int dram_count_banks(void)
++{
++	int i;
++
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS && gd->dram[i].size; i++)
++		;
++
++	return i;
++}
++
++static void dram_print_banks(void)
++{
++	int i;
++
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS && gd->dram[i].size; i++) {
++		phys_addr_t end = gd->dram[i].start + gd->dram[i].size - 1;
++
++		printf("DRAM bank %d: %pap-%pap\n", i, &gd->dram[i].start,
++		       &end);
++	}
++}
++
++/*
++ * Coreboot table layout, see coreboot's
++ * src/commonlib/include/commonlib/coreboot_tables.h (lb_header /
++ * lb_memory_range; identical to U-Boot's arch/x86/include/asm/
++ * coreboot_tables.h) and depthcharge's payload entry ABI.
++ *
++ * U-Boot on kukui is booted by coreboot + depthcharge.  depthcharge's
++ * vboot kernel path hands the flattened handoff FDT in x0, with /memory
++ * rebuilt from the coreboot memory tables; the altfw payload path hands
++ * the coreboot tables themselves (coreboot's selfload() passes
++ * CBMEM_ID_CBTABLE as the payload entry argument and libpayload's
++ * head.S stores x0 in cb_header_ptr).  Both are preferred over the
++ * control FDT, which hardcodes the DRAM size of the board it was
++ * written for; of the two, the tables are the authoritative map and are
++ * tried first (see dram_init()).
++ */
++#define CB_TAG_MEMORY		0x0001
++#define CB_MEM_RAM		1
++
++struct cb_header {
++	u8 signature[4];
++	u32 header_bytes;
++	u32 header_checksum;
++	u32 table_bytes;
++	u32 table_checksum;
++	u32 table_entries;
++};
++
++struct cb_record {
++	u32 tag;
++	u32 size;
++};
++
++struct cbuint64 {
++	u32 lo;
++	u32 hi;
++};
++
++struct cb_memory_range {
++	struct cbuint64 start;
++	struct cbuint64 size;
++	u32 type;
++};
++
++struct cb_memory {
++	u32 tag;
++	u32 size;
++	struct cb_memory_range map[];
++};
++
++static int dram_from_coreboot(phys_addr_t cb_addr)
++{
++	const struct cb_header *hdr = (const void *)(uintptr_t)cb_addr;
++	const struct cb_record *rec;
++	const u8 *table_end;
++	phys_addr_t ram_start = 0;
++	phys_addr_t ram_end = 0;
++	phys_size_t total_size = 0;
++	bool have_ram = false;
++	bool truncated = false;
++	int nbanks = 0;
++	u32 i;
++
++	if (!cb_addr ||
++	    memcmp(hdr->signature, "LBIO", 4) ||
++	    hdr->header_bytes != sizeof(*hdr) ||
++	    hdr->table_entries > hdr->table_bytes / sizeof(*rec))
++		return -EINVAL;
++
++	rec = (const struct cb_record *)(hdr + 1);
++	table_end = (const u8 *)rec + hdr->table_bytes;
++	for (i = 0; i < hdr->table_entries; i++) {
++		if (rec->size < sizeof(*rec) ||
++		    (const u8 *)rec + rec->size > table_end)
++			break;
++
++		if (rec->tag == CB_TAG_MEMORY) {
++			const struct cb_memory *mem = (const void *)rec;
++			u32 nranges = (rec->size - sizeof(*mem)) /
++				      sizeof(struct cb_memory_range);
++			u32 j;
++
++			for (j = 0; j < nranges; j++) {
++				const struct cb_memory_range *range = &mem->map[j];
++				phys_addr_t start, end;
++
++				if (range->type != CB_MEM_RAM)
++					continue;
++
++				start = ((phys_addr_t)range->start.hi << 32) |
++					range->start.lo;
++				end = start + (((phys_addr_t)range->size.hi << 32) |
++					       range->size.lo);
++
++				if (end <= start)
++					continue;
++
++				if (nbanks < CONFIG_NR_DRAM_BANKS) {
++					gd->dram[nbanks].start = start;
++					gd->dram[nbanks].size = end - start;
++					nbanks++;
++				} else {
++					truncated = true;
++				}
++				total_size += end - start;
++
++				if (!have_ram || start < ram_start)
++					ram_start = start;
++				if (end > ram_end)
++					ram_end = end;
++				have_ram = true;
++			}
++		}
++
++		rec = (const struct cb_record *)((const u8 *)rec + rec->size);
++	}
++
++	if (!have_ram || ram_end <= ram_start)
++		return -ENODATA;
++
++	if (truncated)
++		printf("DRAM: coreboot map has more RAM ranges than the %d banks reported\n",
++		       CONFIG_NR_DRAM_BANKS);
++
++	gd->ram_base = ram_start;
++	gd->ram_size = total_size;
++
++	return 0;
++}
++
+ int dram_init(void)
+ {
+-	return fdtdec_setup_mem_size_base();
++	phys_addr_t cb_addr;
++	phys_addr_t base;
++	phys_size_t size;
++
++	if (fdtdec_setup_mem_size_base())
++		return -EINVAL;
++
++	/*
++	 * Zero the bank list up front: gd->dram[] starts out as stale
++	 * stack contents, and dram_init_banksize() keys off bank 0 being
++	 * empty to decide whether to fall back to the single contiguous
++	 * bank.
++	 */
++	memset(gd->dram, 0, sizeof(gd->dram));
++
++	/*
++	 * The control FDT hardcodes the DRAM size of the board it was
++	 * written for; on kukui that is 2 GiB while krane ships 4 GiB
++	 * variants.  U-Boot on krane is booted by coreboot + depthcharge,
++	 * which own the real memory map: coreboot loaded BL31 and reserved
++	 * the SCP and CBMEM regions, and reports the shaped result in its
++	 * memory tables.  Decode the ranges, not just their total:
++	 * dram_init_banksize() publishes them to LMB and the EFI memory
++	 * map, and the OS must see the same holes the boot chain carved
++	 * out.  Flattening them back into usable RAM exposes the
++	 * firmware-owned regions, on krane the ARM Trusted Firmware TZRAM
++	 * at 0x54600000.
++	 */
++	if (!IS_ENABLED(CONFIG_SAVE_PREV_BL_FDT_ADDR))
++		return 0;
++
++	cb_addr = get_prev_bl_fdt_addr();
++
++	/*
++	 * depthcharge flattens the handoff FDT with caches on and jumps
++	 * with them off without cleaning it: the bytes are stranded in
++	 * dirty cache lines and DRAM at the FDT slot reads as zeros
++	 * (observed: x0 = 0x5f800000, fdt_check_header() = -FDT_ERR_BADMAGIC,
++	 * first bytes 00000000 00000000). Clean and invalidate the boot
++	 * CPU caches before decoding either source below.
++	 */
++	flush_dcache_all();
++
++	/*
++	 * The coreboot tables are the authoritative map -- depthcharge's
++	 * /memory is itself rebuilt from them -- and they are maintained
++	 * in DRAM long before the payload runs.  The altfw payload ABI
++	 * passes them in x0; the vboot kernel path passes a handoff FDT
++	 * instead, and the tables are then found at the fixed CBMEM
++	 * address.  Prefer them over the handoff FDT, whose /memory reg
++	 * reads back corrupt on the shipping depthcharge build (a
++	 * zero-size first range followed by nonsensical ones) even though
++	 * the FDT header validates.
++	 */
++	if (!dram_from_coreboot(cb_addr)) {
++		printf("DRAM: coreboot tables at %pap report %llu MiB of usable RAM in %d banks\n",
++		       &cb_addr, (unsigned long long)gd->ram_size >> 20,
++		       dram_count_banks());
++		dram_print_banks();
++
++		return 0;
++	}
++
++	if (!dram_from_coreboot(0xffed9000)) {
++		printf("DRAM: coreboot tables at 0xffed9000 report %llu MiB of usable RAM in %d banks\n",
++		       (unsigned long long)gd->ram_size >> 20,
++		       dram_count_banks());
++		dram_print_banks();
++
++		return 0;
++	}
++
++	/*
++	 * Last resort: a previous bootloader that implements the Linux
++	 * boot ABI and passes an FDT in x0. (failing quietly, not via
++	 * fdt_valid(), when x0 is not an FDT.)
++	 */
++	if (!fdt_check_header((const void *)(uintptr_t)cb_addr) &&
++	    !fdtdec_decode_ram_size((const void *)(uintptr_t)cb_addr,
++				    "/memory", -1, &base, &size, gd) &&
++	    size) {
++		printf("DRAM: previous bootloader FDT at %pap reports %llu MiB of usable RAM in %d banks\n",
++		       &cb_addr, (unsigned long long)size >> 20,
++		       dram_count_banks());
++		dram_print_banks();
++
++		gd->ram_base = base;
++		gd->ram_size = size;
++
++		return 0;
++	}
++
++	return 0;
++}
++
++int dram_init_banksize(void)
++{
++	/*
++	 * dram_init() already filled gd->dram[] with the shaped map the
++	 * previous bootloader published; keep it, so LMB and the EFI memory
++	 * map reproduce the same holes.  Without a decoded map (control FDT
++	 * only, or no previous bootloader) fall back to the default single
++	 * contiguous bank.
++	 */
++	if (gd->dram[0].size)
++		return 0;
++
++	gd->dram[0].start = gd->ram_base;
++	gd->dram[0].size = get_effective_memsize();
++
++	return 0;
+ }
+ 
+ void reset_cpu(void)
+@@ -29,6 +305,21 @@ void reset_cpu(void)
+ 	psci_system_reset();
+ }
+ 
++phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
++{
++	/*
++	 * Keep U-Boot's own allocations inside the first 4 GiB: the msdc
++	 * DMA engine can only address 32 bits, so relocation, heap and
++	 * DMA bounce buffers must not move into the upper DRAM once the
++	 * real 4 GiB size is reported. The OS still receives the full
++	 * range through the EFI memory map.
++	 */
++	if (gd->ram_top > 0x100000000ULL)
++		return 0x100000000ULL;
++
++	return gd->ram_top;
++}
++
+ #if !IS_ENABLED(CONFIG_VIDEO_MT8183_DISPLAY)
+ /*
+  * ExitBootServices handoff hook, used when the MT8183 display drivers
+diff --git a/configs/mt8183_kukui_krane_defconfig b/configs/mt8183_kukui_krane_defconfig
+index 85c327f87dd..305cc694759 100644
+--- a/configs/mt8183_kukui_krane_defconfig
++++ b/configs/mt8183_kukui_krane_defconfig
+@@ -2,9 +2,9 @@ CONFIG_ARM=y
+ CONFIG_COUNTER_FREQUENCY=13000000
+ CONFIG_POSITION_INDEPENDENT=y
+ CONFIG_ARCH_MEDIATEK=y
+-CONFIG_TEXT_BASE=0x4c000000
++CONFIG_TEXT_BASE=0x4C001000
+ CONFIG_SYS_MALLOC_F_LEN=0x4000
+-CONFIG_NR_DRAM_BANKS=1
++CONFIG_NR_DRAM_BANKS=8
+ CONFIG_ENV_SIZE=0x1000
+ CONFIG_ENV_OFFSET=0x0
+ CONFIG_DM_GPIO=y
+@@ -16,12 +16,12 @@ CONFIG_OF_UPSTREAM=y
+ CONFIG_DEBUG_UART_CLOCK=26000000
+ # CONFIG_PSCI_RESET is not set
+ CONFIG_DEBUG_UART=y
+-# CONFIG_EFI_LOADER is not set
++CONFIG_EFI_LOADER=y
+ # CONFIG_ANDROID_BOOT_IMAGE is not set
+ CONFIG_FIT=y
+ # CONFIG_ARCH_FIXUP_FDT_MEMORY is not set
+ CONFIG_USE_BOOTCOMMAND=y
+-CONFIG_BOOTCOMMAND="run distro_bootcmd"
++CONFIG_BOOTCOMMAND="bootefi bootmgr"
+ CONFIG_DEFAULT_FDT_FILE="mt8183-kukui-krane-sku176"
+ CONFIG_SYS_CBSIZE=256
+ CONFIG_SYS_PBSIZE=276
+@@ -34,7 +34,8 @@ CONFIG_HUSH_PARSER=y
+ # CONFIG_CMD_ELF is not set
+ # CONFIG_CMD_GO is not set
+ # CONFIG_CMD_IMI is not set
+-CONFIG_BOOTDELAY=-1
++CONFIG_BOOTDELAY=2
++CONFIG_USE_PREBOOT=y
+ # CONFIG_CMD_XIMG is not set
+ # CONFIG_CMD_EXPORTENV is not set
+ # CONFIG_CMD_IMPORTENV is not set
+@@ -55,18 +56,34 @@ CONFIG_CMD_SYSBOOT=y
+ CONFIG_CMD_EXT4=y
+ CONFIG_CMD_FAT=y
+ CONFIG_CMD_FS_GENERIC=y
++CONFIG_CMD_USB=y
+ # CONFIG_DOS_PARTITION is not set
+-CONFIG_ENV_IS_IN_MMC=y
+-CONFIG_ENV_MMC_EMMC_HW_PARTITION=2
++CONFIG_ENV_IS_NOWHERE=y
++CONFIG_ENV_SOURCE_FILE="krane"
+ CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG=y
+ CONFIG_CLK=y
+ CONFIG_VIDEO=y
+-CONFIG_VIDEO_MT8183_SCANOUT=y
++CONFIG_MT8183_GPIO=y
++CONFIG_POWER=y
++CONFIG_DM_REGULATOR=y
++CONFIG_DM_REGULATOR_FIXED=y
++CONFIG_VIDEO_MIPI_DSI=y
++CONFIG_VIDEO_MT8183_DISPLAY=y
++CONFIG_VIDEO_DAMAGE=y
+ # CONFIG_INPUT is not set
+ # CONFIG_MMC_QUIRKS is not set
+ CONFIG_MMC_MTK=y
+-# CONFIG_POWER is not set
+-CONFIG_BAUDRATE=921600
++CONFIG_PHY=y
++CONFIG_PHY_MTK_TPHY=y
++CONFIG_CONSOLE_ROTATION=y
++CONFIG_USB=y
++CONFIG_USB_HUB_DEBOUNCE_TIMEOUT=200
++CONFIG_DM_USB=y
++CONFIG_USB_XHCI_HCD=y
++CONFIG_USB_XHCI_MTK=y
++CONFIG_USB_KEYBOARD=y
++CONFIG_USB_STORAGE=y
++CONFIG_BAUDRATE=115200
+ CONFIG_DM_SERIAL=y
+ CONFIG_DEBUG_UART_ANNOUNCE=y
+ CONFIG_MTK_SERIAL=y
+@@ -74,3 +91,9 @@ CONFIG_WDT=y
+ CONFIG_WDT_MTK=y
+ # CONFIG_RANDOM_UUID is not set
+ # CONFIG_REGEX is not set
++CONFIG_SAVE_PREV_BL_FDT_ADDR=y
++CONFIG_MTK_MEM_MAP_DDR_SIZE=0x100000000
++# CONFIG_TOOLS_KWBIMAGE is not set
++# CONFIG_TOOLS_LIBCRYPTO is not set
++# CONFIG_VIDEO_FONT_8X16 is not set
++CONFIG_VIDEO_FONT_16X32=y
+-- 
+2.53.0
+

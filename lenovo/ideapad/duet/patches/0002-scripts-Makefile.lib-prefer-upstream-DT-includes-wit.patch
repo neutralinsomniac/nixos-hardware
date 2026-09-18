@@ -1,0 +1,40 @@
+From 8bb0fb027f2c85d641023f42bddeb94a418af075 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:05:53 +0200
+Subject: [PATCH 02/21] scripts: Makefile.lib: prefer upstream DT includes with
+ OF_UPSTREAM
+
+Device trees imported from Linux (dts/upstream) include their
+dt-bindings headers from dts/upstream/include, but the dtc preprocessor
+search order places U-Boot's legacy in-tree include/ first. When a SoC
+has both a legacy dt-bindings header (used by non-upstream in-tree
+device trees) and an upstream one, the legacy copy shadows the upstream
+one and silently misresolves the clock/reset/power macros whose
+numbering changed between generations.
+
+Prefer dts/upstream/include when building with CONFIG_OF_UPSTREAM. The
+upstream imported device trees are written against the upstream
+bindings, and no current OF_UPSTREAM user builds legacy in-tree device
+trees.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ scripts/Makefile.lib | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 122c8e78204..61655240b39 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -255,6 +255,8 @@ upstream_dtsi_include = $(addprefix -I, $(srctree)/dts/upstream/src/ \
+ 		 $(sort $(dir $(wildcard $(srctree)/dts/upstream/src/arm64/*/*))) \
+ 		 $(sort $(dir $(wildcard $(srctree)/dts/upstream/src/arm64/*/*/*)))))
+ dtc_cpp_flags  = -Wp,-MD,$(depfile).pre.tmp -nostdinc                    \
++		 $(if $(CONFIG_OF_UPSTREAM), \
++		      -I$(srctree)/dts/upstream/include) \
+ 		 $(UBOOTINCLUDE)                                         \
+ 		 -I$(dir $<)                                             \
+ 		 -I$(u_boot_dtsi_loc)                                     \
+-- 
+2.53.0
+

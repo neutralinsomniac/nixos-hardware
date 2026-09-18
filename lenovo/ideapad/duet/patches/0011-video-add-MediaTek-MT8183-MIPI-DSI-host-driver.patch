@@ -1,0 +1,906 @@
+From 09a59b723b80339e9c427094bd2ba98c6496c65f Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:11:44 +0200
+Subject: [PATCH 11/21] video: add MediaTek MT8183 MIPI DSI host driver
+
+Add a driver for the MT8183 MIPI DSI host controller (DSI0).  It
+implements the DSI_HOST uclass: init() brings up the clock gates, the
+external MIPI TX D-PHY (through the generic PHY API), the D-PHY timing
+registers and the video mode timing, and enable() switches the host to
+video mode and starts the stream, so that panel initialization can be
+performed over the command FIFO in between.
+
+The register map and the D-PHY timing computation are ported from the
+Linux kernel driver drivers/gpu/drm/mediatek/mtk_dsi.c; the video mode
+timing computation (including the D-PHY turnaround adjustment taken
+out of the horizontal porch) and the command queue programming follow
+the ChromeOS coreboot port src/soc/mediatek/common/dsi.c, which is
+proven to drive this controller on the kukui family of boards.
+
+DSI transfers are performed through the command queue in low power
+mode for panels that request it and high speed otherwise, with bus
+turn-around and receive support for read commands.  The panel child
+node of the DSI controller is bound from the bind() hook.
+
+Details of the command-mode handshake, each following the proven
+coreboot port:
+
+- Bypass the MT8183 register shadow before touching the engine: writes
+  only take effect on a commit event, which never arrives in command
+  mode.  Without the force-commit every engine register write of a
+  command transfer is deferred and each transfer stalls until its
+  polls expire.
+
+- Force command mode at the end of init, before the panel commands.
+  The coreboot port never writes the mode register and relies on its
+  reset default, but U-Boot runs after a firmware handoff that left
+  the engine in video mode (DSI_MODE_CTRL survives the handoff and
+  the core reset), where the command-queue handshake never completes:
+  DSI_BUSY latches and CMD_DONE never fires.
+
+- Clear DSI_INTSTA with a plain zero write after the idle wait: the
+  flag bits clear on a write of 0 and the BUSY latch releases with
+  them.  A read-modify-write that preserves DSI_BUSY re-latches the
+  engine, and the read-side RACK handshake is never needed on the
+  write path.
+
+- Poll DSI_BUSY through readl_poll_timeout(), but wait for the
+  completion flag in an open-coded loop: the compiled
+  readl_poll_timeout() at that call site polls the register exactly
+  once and returns -ETIMEDOUT immediately whatever the window.
+
+- A transfer that still fails releases the engine through a core
+  reset and resends the same command once with a five times longer
+  window; a write that never completes even then is treated as
+  non-fatal, since a wedged single write is less harmful than
+  skipping the rest of the panel init, and the freshly reset engine
+  lets the following transfers start from a clean state.  Read
+  failures remain fatal.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ MAINTAINERS             |   1 +
+ drivers/video/Kconfig   |  11 +
+ drivers/video/Makefile  |   1 +
+ drivers/video/mtk_dsi.c | 789 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 802 insertions(+)
+ create mode 100644 drivers/video/mtk_dsi.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 68931765f42..04940dfc6ee 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -423,6 +423,7 @@ F:	drivers/phy/phy-mtk-mipi-tx.c
+ F:	drivers/power/domain/mt*
+ F:	drivers/power/regulator/mt*.c
+ F:	drivers/usb/mtu3/
++F:	drivers/video/mtk_dsi.c
+ F:	include/power/mt*.h
+ N:	mediatek
+ N:	mtk
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index 15000e21840..b42c3c565fb 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -1426,3 +1426,14 @@ config SPL_HIDE_LOGO_VERSION
+ endif
+ 
+ endmenu
++
++config VIDEO_MTK_DSI
++	bool "MediaTek MT8183 MIPI DSI host driver"
++	depends on ARCH_MEDIATEK && VIDEO_MIPI_DSI && PHY
++	select CLK
++	help
++	  Enable the MediaTek MT8183 MIPI DSI host (DSI0) driver. The host
++	  is driven in command mode to initialize the panel and switches to
++	  video mode to stream out pixels. It relies on the MMSYS display
++	  gates being available through the clock framework and on the
++	  MT8183 MIPI TX D-PHY (PHY_MTK_MIPI_TX).
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index 082b8967982..15c598a437a 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -94,3 +94,4 @@ obj-$(CONFIG_VIDEO_ZYNQMP_DPSUB) += zynqmp/
+ obj-y += bridge/
+ obj-y += sunxi/
+ obj-y += tegra/
++obj-$(CONFIG_VIDEO_MTK_DSI) += mtk_dsi.o
+diff --git a/drivers/video/mtk_dsi.c b/drivers/video/mtk_dsi.c
+new file mode 100644
+index 00000000000..697db6557ce
+--- /dev/null
++++ b/drivers/video/mtk_dsi.c
+@@ -0,0 +1,789 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT8183 MIPI DSI host driver.
++ *
++ * Copyright (C) 2026 Vincent Haudiquet <vhaudiquet@gmail.com>
++ *
++ * Ported from the Linux kernel driver drivers/gpu/drm/mediatek/mtk_dsi.c
++ * (register map and D-PHY timing computation) and from the ChromeOS
++ * coreboot port src/soc/mediatek/common/dsi.c (video mode timing and the
++ * command FIFO programming), the two implementations proven to drive
++ * this host controller on the kukui family of boards.
++ */
++
++#include <clk.h>
++#include <dm.h>
++#include <dsi_host.h>
++#include <generic-phy.h>
++#include <asm/io.h>
++#include <dm/device_compat.h>
++#include <linux/bitops.h>
++#include <div64.h>
++#include <linux/iopoll.h>
++
++/* DSI_START */
++#define DSI_START		0x00
++
++/* DSI_INTSTA */
++#define DSI_INTSTA		0x0c
++#define LPRX_RD_RDY_INT_FLAG	BIT(0)
++#define CMD_DONE_INT_FLAG	BIT(1)
++#define VM_DONE_INT_FLAG	BIT(3)
++#define DSI_BUSY		BIT(31)
++
++/* DSI_RACK: read-acknowledge; releases the latched DSI_BUSY state */
++#define DSI_RACK		0x84
++#define RACK			BIT(0)
++
++/* DSI_CON_CTRL */
++#define DSI_CON_CTRL		0x10
++#define DSI_RESET		BIT(0)
++#define DSI_EN			BIT(1)
++#define DPHY_RESET		BIT(2)
++
++/* DSI_MODE_CTRL */
++#define DSI_MODE_CTRL		0x14
++#define CMD_MODE		0
++#define SYNC_PULSE_MODE		1
++#define SYNC_EVENT_MODE		2
++#define BURST_MODE		3
++
++/* DSI_TXRX_CTRL */
++#define DSI_TXRX_CTRL		0x18
++#define EOTP_DISABLE		BIT(6)
++#define NON_CONTINUOUS_CLK	BIT(16)
++
++/* DSI_PSCTRL */
++#define DSI_PSCTRL		0x1c
++#define DSI_PS_WC		0x3fff
++#define PACKED_PS_16BIT_RGB565	(0 << 16)
++#define LOOSELY_PS_18BIT_RGB666	(0x1 << 16)
++#define PACKED_PS_18BIT_RGB666	(0x2 << 16)
++#define PACKED_PS_24BIT_RGB888	(0x3 << 16)
++#define PIXEL_STREAM_CUSTOM_HEADER_SHIFT	26
++#define PIXEL_STREAM_CUSTOM_HEADER	0xb
++
++/* DSI_SIZE_CON */
++#define DSI_SIZE_CON		0x38
++#define DSI_SIZE_CON_HEIGHT_SHIFT	16
++#define DSI_SIZE_CON_WIDTH_SHIFT	0
++
++/* Per-line word counts */
++#define DSI_VSA_NL		0x20
++#define DSI_VBP_NL		0x24
++#define DSI_VFP_NL		0x28
++#define DSI_VACT_NL		0x2c
++#define DSI_HSA_WC		0x50
++#define DSI_HBP_WC		0x54
++#define DSI_HFP_WC		0x58
++
++/* DSI_CMDQ_SIZE */
++#define DSI_CMDQ_SIZE		0x60
++#define CMDQ_SIZE		0x3f
++
++/* DSI_PHY_LCCON */
++#define DSI_PHY_LCCON		0x104
++#define LC_HS_TX_EN		BIT(0)
++
++/* DSI_PHY_TIMECON0..3 */
++#define DSI_PHY_TIMECON0	0x110
++#define DSI_PHY_TIMECON1	0x114
++#define DSI_PHY_TIMECON2	0x118
++#define DSI_PHY_TIMECON3	0x11c
++
++/* DSI_CMDQ0 */
++#define DSI_CMDQ0		0x200
++#define CONFIG			(0xff << 0)
++#define SHORT_PACKET		0
++#define LONG_PACKET		2
++#define BTA			BIT(2)
++#define HSTX			BIT(3)
++#define DATA_ID			(0xff << 8)
++#define DATA_0			(0xff << 16)
++#define DATA_1			(0xff << 24)
++
++/* DSI_RX_DATA0 */
++#define DSI_RX_DATA0		0x74
++
++/* DSI_FORCE_COMMIT */
++#define DSI_FORCE_COMMIT	0x190
++#define DSI_FORCE_COMMIT_USE_MMSYS	BIT(0)
++#define DSI_FORCE_COMMIT_ALWAYS		BIT(1)
++
++#define MIN_HFP_BYTE		2
++#define MIN_HBP_BYTE		2
++
++#define CMD_DONE_TIMEOUT_US	20000
++
++/*
++ * The engine reports a latched DSI_BUSY at the start of every panel-init
++ * command and neither a zero write to DSI_INTSTA nor RACK releases it;
++ * only the core reset does. Polling the full done window before that
++ * reset just burns wall time: a short packet transmits in ~100 us of LP,
++ * so 1 ms is already generous before falling back to the reset.
++ */
++#define BUSY_TIMEOUT_US		1000
++
++struct mtk_phy_timing {
++	u32 lpx;
++	u32 da_hs_prepare;
++	u32 da_hs_zero;
++	u32 da_hs_trail;
++	u32 ta_go;
++	u32 ta_sure;
++	u32 ta_get;
++	u32 da_hs_exit;
++	u32 da_hs_sync;
++	u32 clk_hs_prepare;
++	u32 clk_hs_post;
++	u32 clk_hs_trail;
++	u32 clk_hs_zero;
++	u32 clk_hs_exit;
++};
++
++struct mtk_dsi {
++	void __iomem *regs;
++	struct mipi_dsi_host host;
++	struct mipi_dsi_device *device;
++	struct display_timing timing;
++	struct clk clk_engine;
++	struct clk clk_digital;
++	struct phy dphy;
++	bool phy_on;
++	bool video_mode;
++	u32 lanes;
++	u32 data_rate;
++	struct mtk_phy_timing phy_timing;
++};
++
++static inline struct mtk_dsi *host_to_mtk_dsi(struct mipi_dsi_host *host)
++{
++	return container_of(host, struct mtk_dsi, host);
++}
++
++static u32 mtk_dsi_bits_per_pixel(enum mipi_dsi_pixel_format format)
++{
++	switch (format) {
++	case MIPI_DSI_FMT_RGB565:
++		return 16;
++	case MIPI_DSI_FMT_RGB666_PACKED:
++		return 18;
++	case MIPI_DSI_FMT_RGB666:
++	case MIPI_DSI_FMT_RGB888:
++	default:
++		return 24;
++	}
++}
++
++static void mtk_dsi_start(struct mtk_dsi *dsi)
++{
++	writel(0, dsi->regs + DSI_START);
++	writel(1, dsi->regs + DSI_START);
++}
++
++static void mtk_dsi_stop(struct mtk_dsi *dsi)
++{
++	writel(0, dsi->regs + DSI_START);
++}
++
++/*
++ * D-PHY timing computation, from mtk_dsi_phy_timing() in both the Linux
++ * driver and the coreboot port. The values are in units of byte clocks at
++ * the selected data rate.
++ */
++static void mtk_dsi_phy_timing(struct mtk_dsi *dsi)
++{
++	struct mtk_phy_timing *t = &dsi->phy_timing;
++	u32 data_rate_mhz = DIV_ROUND_UP(dsi->data_rate, 1000000);
++	u32 timcon0, timcon1, timcon2, timcon3;
++
++	memset(t, 0, sizeof(*t));
++
++	t->lpx = (60 * data_rate_mhz / (8 * 1000)) + 1;
++	t->da_hs_prepare = (80 * data_rate_mhz + 4 * 1000) / 8000;
++	t->da_hs_zero = (170 * data_rate_mhz + 10 * 1000) / 8000 + 1 -
++			t->da_hs_prepare;
++	t->da_hs_trail = t->da_hs_prepare + 1;
++
++	t->ta_go = 4 * t->lpx - 2;
++	t->ta_sure = t->lpx + 2;
++	t->ta_get = 4 * t->lpx;
++	t->da_hs_exit = 2 * t->lpx + 1;
++
++	t->da_hs_sync = 1;
++
++	t->clk_hs_prepare = 70 * data_rate_mhz / (8 * 1000);
++	t->clk_hs_post = t->clk_hs_prepare + 8;
++	t->clk_hs_trail = t->clk_hs_prepare;
++	t->clk_hs_zero = t->clk_hs_trail * 4;
++	t->clk_hs_exit = 2 * t->clk_hs_trail;
++
++	timcon0 = t->lpx | t->da_hs_prepare << 8 | t->da_hs_zero << 16 |
++		  t->da_hs_trail << 24;
++	timcon1 = t->ta_go | t->ta_sure << 8 | t->ta_get << 16 |
++		  t->da_hs_exit << 24;
++	timcon2 = t->da_hs_sync << 8 | t->clk_hs_zero << 16 |
++		  t->clk_hs_trail << 24;
++	timcon3 = t->clk_hs_prepare | t->clk_hs_post << 8 |
++		  t->clk_hs_exit << 16;
++
++	writel(timcon0, dsi->regs + DSI_PHY_TIMECON0);
++	writel(timcon1, dsi->regs + DSI_PHY_TIMECON1);
++	writel(timcon2, dsi->regs + DSI_PHY_TIMECON2);
++	writel(timcon3, dsi->regs + DSI_PHY_TIMECON3);
++}
++
++static void mtk_dsi_reset(struct mtk_dsi *dsi)
++{
++	/*
++	 * The MT8183 DSI core shadows its configuration registers: writes
++	 * only take effect on a commit event (an MMSYS trigger or an
++	 * explicit force-commit), which in command mode never arrives.
++	 * Both proven implementations bypass the shadow before programming
++	 * the engine — mtk_dsi_poweron() of the Linux driver (MT8183 sets
++	 * has_shadow_ctl) writes FORCE_COMMIT | BYPASS_SHADOW to the same
++	 * register, and mtk_dsi_reset() of the coreboot port writes
++	 * USE_MMSYS | ALWAYS. Without it every engine register write is
++	 * deferred and each command transfer stalls until the busy/done
++	 * polls time out.
++	 */
++	writel(DSI_FORCE_COMMIT_USE_MMSYS | DSI_FORCE_COMMIT_ALWAYS,
++	       dsi->regs + DSI_FORCE_COMMIT);
++
++	/*
++	 * Enable the DSI core, then pulse the core reset while keeping
++	 * the enable bit, like mtk_dsi_enable() + mtk_dsi_reset_engine()
++	 * of the Linux driver. Writing CON_CTRL directly would clear
++	 * DSI_EN and leave the engine disabled for the panel
++	 * initialization commands that follow.
++	 */
++	setbits_le32(dsi->regs + DSI_CON_CTRL, DSI_EN);
++	setbits_le32(dsi->regs + DSI_CON_CTRL, DSI_RESET);
++	clrbits_le32(dsi->regs + DSI_CON_CTRL, DSI_RESET);
++}
++
++static void mtk_dsi_reset_dphy(struct mtk_dsi *dsi)
++{
++	setbits_le32(dsi->regs + DSI_CON_CTRL, DPHY_RESET);
++	clrbits_le32(dsi->regs + DSI_CON_CTRL, DPHY_RESET);
++}
++
++static void mtk_dsi_rxtx_control(struct mtk_dsi *dsi)
++{
++	u32 val;
++
++	switch (dsi->lanes) {
++	case 1:
++		val = 1 << 2;
++		break;
++	case 2:
++		val = 3 << 2;
++		break;
++	case 3:
++		val = 7 << 2;
++		break;
++	case 4:
++	default:
++		val = 0xf << 2;
++		break;
++	}
++
++	if (dsi->device->mode_flags & MIPI_DSI_CLOCK_NON_CONTINUOUS)
++		val |= NON_CONTINUOUS_CLK;
++
++	/*
++	 * EOT packets are disabled unless the panel requests them (the
++	 * same logic as mtk_dsi_rxtx_control() in the coreboot port).
++	 */
++	if (!(dsi->device->mode_flags & MIPI_DSI_MODE_EOT_PACKET))
++		val |= EOTP_DISABLE;
++
++	writel(val, dsi->regs + DSI_TXRX_CTRL);
++}
++
++static void mtk_dsi_clk_hs_mode_enable(struct mtk_dsi *dsi)
++{
++	setbits_le32(dsi->regs + DSI_PHY_LCCON, LC_HS_TX_EN);
++}
++
++static void mtk_dsi_clk_hs_mode_disable(struct mtk_dsi *dsi)
++{
++	clrbits_le32(dsi->regs + DSI_PHY_LCCON, LC_HS_TX_EN);
++}
++
++static void mtk_dsi_set_mode(struct mtk_dsi *dsi, u32 mode_flags)
++{
++	u32 val = CMD_MODE;
++
++	if (mode_flags & MIPI_DSI_MODE_VIDEO) {
++		if (mode_flags & MIPI_DSI_MODE_VIDEO_BURST)
++			val = BURST_MODE;
++		else if (mode_flags & MIPI_DSI_MODE_VIDEO_SYNC_PULSE)
++			val = SYNC_PULSE_MODE;
++		else
++			val = SYNC_EVENT_MODE;
++	}
++
++	writel(val, dsi->regs + DSI_MODE_CTRL);
++}
++
++static void mtk_dsi_config_vdo_timing(struct mtk_dsi *dsi)
++{
++	struct display_timing *timing = &dsi->timing;
++	u32 bpp = mtk_dsi_bits_per_pixel(dsi->device->format);
++	u32 bytes_per_pixel = DIV_ROUND_UP(bpp, 8);
++	u32 hsync_active_byte, hbp_byte, hfp_byte, data_phy_cycles, d_phy;
++	u32 packet_fmt, hactive;
++	s32 hfp_adjust, hbp_adjust;
++
++	writel(timing->vsync_len.typ, dsi->regs + DSI_VSA_NL);
++	writel(timing->vback_porch.typ, dsi->regs + DSI_VBP_NL);
++	writel(timing->vfront_porch.typ, dsi->regs + DSI_VFP_NL);
++	writel(timing->vactive.typ, dsi->regs + DSI_VACT_NL);
++
++	hsync_active_byte = timing->hsync_len.typ * bytes_per_pixel - 10;
++
++	if (dsi->device->mode_flags & MIPI_DSI_MODE_VIDEO_SYNC_PULSE)
++		hbp_byte = timing->hback_porch.typ * bytes_per_pixel - 10;
++	else
++		hbp_byte = (timing->hback_porch.typ +
++			    timing->hsync_len.typ) * bytes_per_pixel - 10;
++	hfp_byte = timing->hfront_porch.typ * bytes_per_pixel;
++
++	/*
++	 * The D-PHY needs some of the horizontal blanking to switch
++	 * between LP and HS, from mtk_dsi_config_vdo_timing() in the
++	 * coreboot port.
++	 */
++	data_phy_cycles = dsi->phy_timing.lpx + dsi->phy_timing.da_hs_prepare +
++			  dsi->phy_timing.da_hs_zero +
++			  dsi->phy_timing.da_hs_exit + 3;
++	d_phy = data_phy_cycles * dsi->lanes + 10;
++
++	hfp_adjust = (s32)timing->hfront_porch.typ;
++	hbp_adjust = (s32)timing->hback_porch.typ;
++	if ((hfp_adjust + hbp_adjust) * (s32)bytes_per_pixel > (s32)d_phy) {
++		hfp_byte -= d_phy * hfp_adjust / (hfp_adjust + hbp_adjust);
++		hbp_byte -= d_phy * hbp_adjust / (hfp_adjust + hbp_adjust);
++	} else {
++		dev_warn(dsi->host.dev,
++			 "HFP + HBP too small for the D-PHY turnaround, the panel may misbehave\n");
++	}
++
++	if (hfp_byte + hbp_byte < MIN_HFP_BYTE + MIN_HBP_BYTE) {
++		dev_warn(dsi->host.dev,
++			 "HFP/HBP too small, the panel may misbehave\n");
++	} else if (hfp_byte < MIN_HFP_BYTE) {
++		hbp_byte -= MIN_HFP_BYTE - hfp_byte;
++		hfp_byte = MIN_HFP_BYTE;
++	} else if (hbp_byte < MIN_HBP_BYTE) {
++		hfp_byte -= MIN_HBP_BYTE - hbp_byte;
++		hbp_byte = MIN_HBP_BYTE;
++	}
++
++	writel(hsync_active_byte, dsi->regs + DSI_HSA_WC);
++	writel(hbp_byte, dsi->regs + DSI_HBP_WC);
++	writel(hfp_byte, dsi->regs + DSI_HFP_WC);
++
++	switch (dsi->device->format) {
++	case MIPI_DSI_FMT_RGB565:
++		packet_fmt = PACKED_PS_16BIT_RGB565;
++		break;
++	case MIPI_DSI_FMT_RGB666:
++		packet_fmt = LOOSELY_PS_18BIT_RGB666;
++		break;
++	case MIPI_DSI_FMT_RGB666_PACKED:
++		packet_fmt = PACKED_PS_18BIT_RGB666;
++		break;
++	case MIPI_DSI_FMT_RGB888:
++	default:
++		packet_fmt = PACKED_PS_24BIT_RGB888;
++		break;
++	}
++
++	hactive = timing->hactive.typ;
++	packet_fmt |= (hactive * bytes_per_pixel) & DSI_PS_WC;
++
++	writel(PIXEL_STREAM_CUSTOM_HEADER << PIXEL_STREAM_CUSTOM_HEADER_SHIFT |
++	       packet_fmt, dsi->regs + DSI_PSCTRL);
++
++	writel(timing->vactive.typ << DSI_SIZE_CON_HEIGHT_SHIFT |
++	       hactive << DSI_SIZE_CON_WIDTH_SHIFT,
++	       dsi->regs + DSI_SIZE_CON);
++}
++
++static bool mtk_dsi_is_read_command(u32 type)
++{
++	switch (type) {
++	case MIPI_DSI_GENERIC_READ_REQUEST_0_PARAM:
++	case MIPI_DSI_GENERIC_READ_REQUEST_1_PARAM:
++	case MIPI_DSI_GENERIC_READ_REQUEST_2_PARAM:
++	case MIPI_DSI_DCS_READ:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * The DSI core latches DSI_BUSY and the interrupt flags in DSI_INTSTA,
++ * and the flag bits clear on a write of 0: clear the whole register with
++ * a plain zero write, like mtk_dsi_cmdq() of the coreboot port this
++ * handshake is modeled on. A read-modify-write that preserves DSI_BUSY
++ * re-latches the engine, and a read-side RACK handshake is never needed
++ * on this write-only path: either one left every panel-init command
++ * burning the full 20 ms busy window.
++ */
++static void mtk_dsi_irq_clear(struct mtk_dsi *dsi)
++{
++	writel(0, dsi->regs + DSI_INTSTA);
++}
++
++static int mtk_dsi_wait_not_busy(struct mtk_dsi *dsi)
++{
++	u32 sta;
++
++	return readl_poll_timeout(dsi->regs + DSI_INTSTA, sta,
++				  !(sta & DSI_BUSY), BUSY_TIMEOUT_US);
++}
++
++static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
++				     const struct mipi_dsi_msg *msg)
++{
++	struct mtk_dsi *dsi = host_to_mtk_dsi(host);
++	const u8 *tx_buf = msg->tx_buf;
++	u32 config, reg_val, cmdq_size, sta;
++	bool was_video_mode = dsi->video_mode;
++	ssize_t ret = 0;
++	unsigned int attempt;
++	int i, j;
++	u64 t0, window;
++
++	if (was_video_mode) {
++		mtk_dsi_stop(dsi);
++		mtk_dsi_set_mode(dsi, 0); /* back to command mode */
++	}
++
++	ret = mtk_dsi_wait_not_busy(dsi);
++	if (ret) {
++		/*
++		 * The boot firmware may have left the engine in a state
++		 * where polling alone never recovers; re-enable and reset
++		 * the core like mtk_dsi_wait_for_idle() of the Linux
++		 * driver, then try once more.
++		 */
++		mtk_dsi_reset(dsi);
++		ret = mtk_dsi_wait_not_busy(dsi);
++	}
++	if (ret) {
++		dev_err(host->dev, "DSI busy, cannot send command\n");
++		goto out;
++	}
++
++	mtk_dsi_irq_clear(dsi);
++
++	if (mtk_dsi_is_read_command(msg->type))
++		config = BTA;
++	else
++		config = (msg->tx_len > 2) ? LONG_PACKET : SHORT_PACKET;
++
++	if (!(msg->flags & MIPI_DSI_MSG_USE_LPM))
++		config |= HSTX;
++
++	if (msg->tx_len > 2) {
++		/*
++		 * Long packet: the first command queue word carries the
++		 * configuration and the packet header, the following
++		 * words carry the payload, 4 bytes each.
++		 */
++		reg_val = ((u32)msg->tx_len << 16) | ((u32)msg->type << 8) |
++			  config;
++		writel(reg_val, dsi->regs + DSI_CMDQ0);
++		for (i = 0; i < msg->tx_len; i += 4) {
++			u32 val = 0;
++
++			for (j = 0; j < 4 && i + j < msg->tx_len; j++)
++				val |= (u32)tx_buf[i + j] << (j * 8);
++			writel(val, dsi->regs + DSI_CMDQ0 + 4 + (i / 4) * 4);
++		}
++		cmdq_size = 1 + DIV_ROUND_UP(msg->tx_len, 4);
++	} else {
++		/* Short packet: parameters packed in the header word. */
++		reg_val = ((u32)msg->type << 8) | config;
++		for (i = 0; i < msg->tx_len; i++)
++			reg_val |= (u32)tx_buf[i] << ((i + 2) * 8);
++		writel(reg_val, dsi->regs + DSI_CMDQ0);
++		cmdq_size = 1;
++	}
++	for (attempt = 0; attempt < 2; attempt++) {
++		if (attempt) {
++			/*
++			 * One flake must not abort the whole panel init:
++			 * drain the engine like the busy-path recovery
++			 * does, then requeue the same command once, with
++			 * a five times longer window -- commands around
++			 * the panel mode switches can hold the link busy
++			 * well past the regular timeout.
++			 */
++			mtk_dsi_reset(dsi);
++			mtk_dsi_irq_clear(dsi);
++		}
++
++		writel(cmdq_size, dsi->regs + DSI_CMDQ_SIZE);
++		mtk_dsi_start(dsi);
++
++		/*
++		 * Wait for the completion flag, open-coded: the compiled
++		 * readl_poll_timeout() at this call site polls the register
++		 * exactly once and returns -ETIMEDOUT immediately whatever
++		 * the window, with no spin loop at all.
++		 */
++		window = attempt ? 5 * CMD_DONE_TIMEOUT_US :
++				   CMD_DONE_TIMEOUT_US;
++		t0 = timer_get_us();
++		ret = -ETIMEDOUT;
++		while (timer_get_us() - t0 < window) {
++			sta = readl(dsi->regs + DSI_INTSTA);
++			if (sta & (CMD_DONE_INT_FLAG | LPRX_RD_RDY_INT_FLAG)) {
++				ret = 0;
++				break;
++			}
++		}
++		if (!ret)
++			break;
++	}
++	if (ret) {
++		if (mtk_dsi_is_read_command(msg->type)) {
++			dev_err(host->dev, "failed to send DSI command\n");
++			goto out;
++		}
++
++		/*
++		 * The write never completed even after the engine reset;
++		 * a wedged single write is less harmful than skipping the
++		 * rest of the panel init and losing the cold path over it.
++		 * The engine was freshly reset by the retry, so the
++		 * following transfers start from a clean state.
++		 */
++		dev_err(host->dev, "DSI write %#04x timed out, continuing\n",
++			tx_buf[0]);
++		ret = msg->tx_len;
++	}
++
++	if (mtk_dsi_is_read_command(msg->type) && msg->rx_buf) {
++		u8 rx[16];
++
++		for (i = 0; i < 16; i++)
++			rx[i] = readb(dsi->regs + DSI_RX_DATA0 + i);
++		/*
++		 * Short responses carry the payload from byte 1, long
++		 * ones from byte 4 (after the 2-byte header).
++		 */
++		if (msg->rx_len > 2)
++			memcpy(msg->rx_buf, rx + 4,
++			       min_t(size_t, msg->rx_len, 8));
++		else
++			memcpy(msg->rx_buf, rx + 1,
++			       min_t(size_t, msg->rx_len, 2));
++		ret = msg->rx_len;
++	}
++
++out:
++	if (was_video_mode) {
++		mtk_dsi_set_mode(dsi, dsi->device->mode_flags);
++		mtk_dsi_start(dsi);
++	}
++
++	return ret;
++}
++
++static int mtk_dsi_host_attach(struct mipi_dsi_host *host,
++			       struct mipi_dsi_device *device)
++{
++	struct mtk_dsi *dsi = host_to_mtk_dsi(host);
++
++	dsi->lanes = device->lanes;
++
++	return 0;
++}
++
++static const struct mipi_dsi_host_ops mtk_dsi_host_ops = {
++	.attach = mtk_dsi_host_attach,
++	.transfer = mtk_dsi_host_transfer,
++};
++
++static int mtk_dsi_init(struct udevice *dev,
++			struct mipi_dsi_device *device,
++			struct display_timing *timings,
++			unsigned int max_data_lanes,
++			const struct mipi_dsi_phy_ops *phy_ops)
++{
++	struct mtk_dsi *dsi = dev_get_priv(dev);
++	int bpp, ret;
++
++	/*
++	 * The D-PHY is a separate device on MT8183 (the mipi_tx node);
++	 * it is driven through the generic PHY API, so the phy_ops
++	 * argument of the uclass is unused here.
++	 */
++	(void)phy_ops;
++
++	dsi->device = device;
++	dsi->lanes = device->lanes;
++	dsi->timing = *timings;
++
++	dsi->host.dev = (struct device *)dev;
++	dsi->host.ops = &mtk_dsi_host_ops;
++	device->host = &dsi->host;
++
++	dsi->regs = dev_read_addr_ptr(dev);
++	if (!dsi->regs)
++		return log_msg_ret("regs", -EINVAL);
++
++	if (dsi->lanes > max_data_lanes) {
++		dev_err(dev, "panel uses %u lanes, host supports %u\n",
++			dsi->lanes, max_data_lanes);
++		return -EINVAL;
++	}
++
++	ret = clk_get_by_name(dev, "engine", &dsi->clk_engine);
++	if (ret)
++		return log_msg_ret("clk-engine", ret);
++	ret = clk_get_by_name(dev, "digital", &dsi->clk_digital);
++	if (ret)
++		return log_msg_ret("clk-digital", ret);
++	ret = clk_enable(&dsi->clk_engine);
++	if (ret)
++		return log_msg_ret("clk-engine-en", ret);
++	ret = clk_enable(&dsi->clk_digital);
++	if (ret)
++		return log_msg_ret("clk-digital-en", ret);
++
++	ret = generic_phy_get_by_name(dev, "dphy", &dsi->dphy);
++	if (ret)
++		return log_msg_ret("phy", ret);
++
++	bpp = mipi_dsi_pixel_format_to_bpp(device->format);
++	if (bpp < 0)
++		return log_msg_ret("fmt", bpp);
++
++	dsi->data_rate = DIV_ROUND_UP_ULL((u64)timings->pixelclock.typ * bpp,
++					  dsi->lanes);
++
++	/* Program the MIPI TX PLL for the data rate and power it up. */
++	ret = generic_phy_set_mode(&dsi->dphy, PHY_MODE_MIPI_DPHY,
++				   (int)dsi->data_rate);
++	if (ret)
++		return log_msg_ret("phy-mode", ret);
++	ret = generic_phy_init(&dsi->dphy);
++	if (ret)
++		return log_msg_ret("phy-init", ret);
++	ret = generic_phy_power_on(&dsi->dphy);
++	if (ret)
++		return log_msg_ret("phy-on", ret);
++	dsi->phy_on = true;
++
++	/*
++	 * From here on the sequence follows mtk_dsi_init() of the
++	 * coreboot port (proven on this platform), with the final "switch
++	 * to video mode and start" split out into the enable() op so that
++	 * panel initialization commands can be sent in command mode.
++	 */
++	mtk_dsi_reset(dsi);
++	mtk_dsi_phy_timing(dsi);
++	mtk_dsi_rxtx_control(dsi);
++	mdelay(1);
++	mtk_dsi_reset_dphy(dsi);
++	mtk_dsi_clk_hs_mode_disable(dsi);
++	mtk_dsi_config_vdo_timing(dsi);
++	mtk_dsi_clk_hs_mode_enable(dsi);
++
++	/*
++	 * Force command mode before the panel init commands: the coreboot
++	 * port this sequence follows never writes the mode register and
++	 * relies on its reset default (command mode), but we run after a
++	 * firmware handoff that left the engine in video mode, where the
++	 * command-queue handshake never completes -- the engine reports a
++	 * latched DSI_BUSY and never raises CMD_DONE, which stalled every
++	 * panel-init command. The enable op switches to video mode and
++	 * starts the stream afterwards, like mtk_dsi_set_mode() +
++	 * mtk_dsi_start() do after the init commands in the coreboot port.
++	 */
++	mtk_dsi_set_mode(dsi, 0);
++
++	return 0;
++}
++
++static int mtk_dsi_enable(struct udevice *dev)
++{
++	struct mtk_dsi *dsi = dev_get_priv(dev);
++
++	/* Switch to video mode and start the stream. */
++	mtk_dsi_set_mode(dsi, dsi->device->mode_flags);
++	mtk_dsi_start(dsi);
++	dsi->video_mode = true;
++
++	return 0;
++}
++
++static int mtk_dsi_disable(struct udevice *dev)
++{
++	struct mtk_dsi *dsi = dev_get_priv(dev);
++	u32 sta;
++
++	/*
++	 * Drain the engine before removing its clocks and the D-PHY:
++	 * gating the MIPI PLL or the engine clocks while the host is
++	 * mid-frame leaves the D-PHY and the engine holding an
++	 * in-flight state, and a display engine stalled with an
++	 * outstanding AXI read wedges the SMI/CCI interconnect for the
++	 * next boot stage (the kernel then dies silently at its first
++	 * display domain/clock transition). Mirrors the Linux disable
++	 * order: stop the stream, wait for the engine to go idle (or
++	 * reset the core to drain it), then power the D-PHY off and
++	 * gate the clocks.
++	 */
++	mtk_dsi_stop(dsi);
++	mtk_dsi_irq_clear(dsi);
++	if (readl_poll_timeout(dsi->regs + DSI_INTSTA, sta,
++			       !(sta & DSI_BUSY), CMD_DONE_TIMEOUT_US)) {
++		mtk_dsi_reset(dsi);
++		readl_poll_timeout(dsi->regs + DSI_INTSTA, sta,
++				   !(sta & DSI_BUSY), CMD_DONE_TIMEOUT_US);
++	}
++	dsi->video_mode = false;
++
++	if (dsi->phy_on)
++		generic_phy_power_off(&dsi->dphy);
++	dsi->phy_on = false;
++	clk_disable(&dsi->clk_digital);
++	clk_disable(&dsi->clk_engine);
++
++	return 0;
++}
++
++static int mtk_dsi_bind(struct udevice *dev)
++{
++	/* Bind the panel child node, if any. */
++	return dm_scan_fdt_dev(dev);
++}
++
++static const struct udevice_id mtk_dsi_ids[] = {
++	{ .compatible = "mediatek,mt8183-dsi" },
++	{ }
++};
++
++static const struct dsi_host_ops mtk_dsi_ops = {
++	.init = mtk_dsi_init,
++	.enable = mtk_dsi_enable,
++	.disable = mtk_dsi_disable,
++};
++
++U_BOOT_DRIVER(mtk_dsi) = {
++	.name		= "mtk_dsi",
++	.id		= UCLASS_DSI_HOST,
++	.of_match	= mtk_dsi_ids,
++	.bind		= mtk_dsi_bind,
++	.ops		= &mtk_dsi_ops,
++	.priv_auto	= sizeof(struct mtk_dsi),
++};
+-- 
+2.53.0
+
