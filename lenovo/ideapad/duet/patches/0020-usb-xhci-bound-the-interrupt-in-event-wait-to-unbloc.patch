@@ -1,0 +1,182 @@
+From 077f026ebcf67d35a08b749a3b96a35c482d2c09 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:22:04 +0200
+Subject: [PATCH 20/21] usb: xhci: bound the interrupt-in event wait to unblock
+ the console
+
+usb_int_msg() asks for a nonblocking submission and usb_kbd polls the
+interrupt endpoint on every console input iteration, but the xHCI
+driver ignored that and waited up to XHCI_TIMEOUT (5 s) for the
+completion event of a NAKed interrupt-IN transfer.  Measured on an
+MT8183 ChromeOS tablet with a USB HID keyboard: 33 polls of 391k took
+5.0 s each, and during every such stall the whole console input loop is
+blocked -- host serial keystrokes then overflow the 16-byte UART FIFO
+and come out garbled or lost, while the pogo keyboard feels fine
+because a keypress is what completes the pending poll.
+
+Thread a timeout through xhci_wait_for_event() and use
+XHCI_INT_TIMEOUT (10 ms, above a HID bInterval) for interrupt pipes in
+xhci_bulk_tx(); the existing timeout path aborts the TD cleanly.  Bulk
+and control transfers keep the old 5 s window.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ drivers/usb/host/xhci-ring.c | 23 +++++++++++++----------
+ drivers/usb/host/xhci.c      |  6 +++---
+ include/usb/xhci.h           |  5 ++++-
+ 3 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 6f5c4ec97b6..e37b4b45b77 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -458,7 +458,8 @@ static int event_ready(struct xhci_ctrl *ctrl)
+  * @param expected	TRB type expected from Event TRB
+  * Return: pointer to event trb
+  */
+-union xhci_trb *xhci_wait_for_event(struct xhci_ctrl *ctrl, trb_type expected)
++union xhci_trb *xhci_wait_for_event(struct xhci_ctrl *ctrl, trb_type expected,
++				    unsigned long timeout_ms)
+ {
+ 	trb_type type;
+ 	unsigned long ts = get_timer(0);
+@@ -492,7 +493,7 @@ union xhci_trb *xhci_wait_for_event(struct xhci_ctrl *ctrl, trb_type expected)
+ 				le32_to_cpu(event->generic.field[3]));
+ 
+ 		xhci_acknowledge_event(ctrl);
+-	} while (get_timer(ts) < XHCI_TIMEOUT);
++	} while (get_timer(ts) < timeout_ms);
+ 
+ 	if (expected == TRB_TRANSFER)
+ 		return NULL;
+@@ -516,7 +517,7 @@ static void reset_ep(struct usb_device *udev, int ep_index)
+ 
+ 	printf("Resetting EP %d...\n", ep_index);
+ 	xhci_queue_command(ctrl, 0, udev->slot_id, ep_index, TRB_RESET_EP);
+-	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++	event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return;
+ 
+@@ -526,7 +527,7 @@ static void reset_ep(struct usb_device *udev, int ep_index)
+ 	addr = xhci_trb_virt_to_dma(ring->enq_seg, ring->enqueue) |
+ 		ring->cycle_state;
+ 	xhci_queue_command(ctrl, addr, udev->slot_id, ep_index, TRB_SET_DEQ);
+-	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++	event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return;
+ 
+@@ -555,7 +556,7 @@ static void abort_td(struct usb_device *udev, int ep_index)
+ 
+ 	xhci_queue_command(ctrl, 0, udev->slot_id, ep_index, TRB_STOP_RING);
+ 
+-	event = xhci_wait_for_event(ctrl, TRB_NONE);
++	event = xhci_wait_for_event(ctrl, TRB_NONE, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return;
+ 
+@@ -567,7 +568,7 @@ static void abort_td(struct usb_device *udev, int ep_index)
+ 		BUG_ON(GET_COMP_CODE(le32_to_cpu(event->trans_event.transfer_len != COMP_STOP)));
+ 		xhci_acknowledge_event(ctrl);
+ 
+-		event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++		event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 		if (!event)
+ 			return;
+ 		type = TRB_FIELD_TO_TYPE(le32_to_cpu(event->event_cmd.flags));
+@@ -584,7 +585,7 @@ static void abort_td(struct usb_device *udev, int ep_index)
+ 	addr = xhci_trb_virt_to_dma(ring->enq_seg, ring->enqueue) |
+ 		ring->cycle_state;
+ 	xhci_queue_command(ctrl, addr, udev->slot_id, ep_index, TRB_SET_DEQ);
+-	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++	event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return;
+ 
+@@ -802,7 +803,9 @@ int xhci_bulk_tx(struct usb_device *udev, unsigned long pipe,
+ 	giveback_first_trb(udev, ep_index, start_cycle, start_trb);
+ 
+ again:
+-	event = xhci_wait_for_event(ctrl, TRB_TRANSFER);
++	event = xhci_wait_for_event(ctrl, TRB_TRANSFER,
++				    usb_pipetype(pipe) == PIPE_INTERRUPT ?
++				    XHCI_INT_TIMEOUT : XHCI_TIMEOUT);
+ 	if (!event) {
+ 		debug("XHCI bulk transfer timed out, aborting...\n");
+ 		abort_td(udev, ep_index);
+@@ -1006,7 +1009,7 @@ int xhci_ctrl_tx(struct usb_device *udev, unsigned long pipe,
+ 
+ 	giveback_first_trb(udev, ep_index, start_cycle, start_trb);
+ 
+-	event = xhci_wait_for_event(ctrl, TRB_TRANSFER);
++	event = xhci_wait_for_event(ctrl, TRB_TRANSFER, XHCI_TIMEOUT);
+ 	if (!event)
+ 		goto abort;
+ 	field = le32_to_cpu(event->trans_event.flags);
+@@ -1030,7 +1033,7 @@ int xhci_ctrl_tx(struct usb_device *udev, unsigned long pipe,
+ 	if (GET_COMP_CODE(le32_to_cpu(event->trans_event.transfer_len))
+ 			== COMP_SHORT_TX) {
+ 		/* Short data stage, clear up additional status stage event */
+-		event = xhci_wait_for_event(ctrl, TRB_TRANSFER);
++		event = xhci_wait_for_event(ctrl, TRB_TRANSFER, XHCI_TIMEOUT);
+ 		if (!event)
+ 			goto abort;
+ 		BUG_ON(TRB_TO_SLOT_ID(field) != slot_id);
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index c3986dac3e8..073ee76879a 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -449,7 +449,7 @@ static int xhci_configure_endpoints(struct usb_device *udev, bool ctx_change)
+ 	xhci_flush_cache((uintptr_t)in_ctx->bytes, in_ctx->size);
+ 	xhci_queue_command(ctrl, in_ctx->dma, udev->slot_id, 0,
+ 			   ctx_change ? TRB_EVAL_CONTEXT : TRB_CONFIG_EP);
+-	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++	event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return -ETIMEDOUT;
+ 
+@@ -682,7 +682,7 @@ static int xhci_address_device(struct usb_device *udev, int root_portnr)
+ 
+ 	xhci_queue_command(ctrl, virt_dev->in_ctx->dma,
+ 			   slot_id, 0, TRB_ADDR_DEV);
+-	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++	event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return -ETIMEDOUT;
+ 
+@@ -760,7 +760,7 @@ static int _xhci_alloc_device(struct usb_device *udev)
+ 	}
+ 
+ 	xhci_queue_command(ctrl, 0, 0, 0, TRB_ENABLE_SLOT);
+-	event = xhci_wait_for_event(ctrl, TRB_COMPLETION);
++	event = xhci_wait_for_event(ctrl, TRB_COMPLETION, XHCI_TIMEOUT);
+ 	if (!event)
+ 		return -ETIMEDOUT;
+ 
+diff --git a/include/usb/xhci.h b/include/usb/xhci.h
+index ba065311df5..11f8f5211ed 100644
+--- a/include/usb/xhci.h
++++ b/include/usb/xhci.h
+@@ -28,6 +28,8 @@
+ #define XHCI_ALIGNMENT		64
+ /* Generic timeout for XHCI events */
+ #define XHCI_TIMEOUT		5000
++/* Timeout for interrupt-in event waits (a HID bInterval is ~8-10 ms) */
++#define XHCI_INT_TIMEOUT	10
+ /* Max number of USB devices for any host controller - limit in section 6.1 */
+ #define MAX_HC_SLOTS            256
+ /* Section 5.3.3 - MaxPorts */
+@@ -1252,7 +1254,8 @@ void xhci_setup_addressable_virt_dev(struct xhci_ctrl *ctrl,
+ void xhci_queue_command(struct xhci_ctrl *ctrl, dma_addr_t addr,
+ 			u32 slot_id, u32 ep_index, trb_type cmd);
+ void xhci_acknowledge_event(struct xhci_ctrl *ctrl);
+-union xhci_trb *xhci_wait_for_event(struct xhci_ctrl *ctrl, trb_type expected);
++union xhci_trb *xhci_wait_for_event(struct xhci_ctrl *ctrl, trb_type expected,
++				    unsigned long timeout_ms);
+ int xhci_bulk_tx(struct usb_device *udev, unsigned long pipe,
+ 		 int length, void *buffer);
+ int xhci_ctrl_tx(struct usb_device *udev, unsigned long pipe,
+-- 
+2.53.0
+

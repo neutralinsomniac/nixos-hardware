@@ -1,0 +1,52 @@
+From 6e67a9ab0865743835bf33e23cbbeeef4fb24222 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:17:10 +0200
+Subject: [PATCH 14/21] arm: mediatek: mt8183: enlarge the page-table budget
+ for dynamic display mappings
+
+The MT8183 display driver maps the coreboot table and the framebuffer
+dynamically after relocation (mmu_map_region), which the default
+page-table budget (sized for the static memory map only) does not
+account for.  Reserve enough for those mappings, like the other arm64
+platforms that map memory at runtime; boards without the display
+driver use the default.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ board/mediatek/mt8183/mt8183.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/board/mediatek/mt8183/mt8183.c b/board/mediatek/mt8183/mt8183.c
+index 1b8736966f6..82210cf8a56 100644
+--- a/board/mediatek/mt8183/mt8183.c
++++ b/board/mediatek/mt8183/mt8183.c
+@@ -3,10 +3,25 @@
+  * Copyright (C) 2020 BayLibre SAS
+  * Author: Fabien Parent <fparent@baylibre.com>
+  */
+-
+ #include <dm.h>
++#include <linux/sizes.h>
+ #include <net.h>
+ 
++#if IS_ENABLED(CONFIG_VIDEO_MT8183_DISPLAY)
++/*
++ * The MT8183 display driver maps the coreboot table and the framebuffer
++ * dynamically after relocation (mmu_map_region), which the default
++ * page-table budget (sized for the static memory map only) does not
++ * account for. Reserve enough for those mappings, like the other arm64
++ * platforms that map memory at runtime; boards without the display
++ * driver use the default.
++ */
++u64 get_page_table_size(void)
++{
++	return SZ_256K;
++}
++#endif
++
+ int board_init(void)
+ {
+ 	struct udevice *dev;
+-- 
+2.53.0
+

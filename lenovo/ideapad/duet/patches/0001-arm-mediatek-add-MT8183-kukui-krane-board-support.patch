@@ -1,0 +1,136 @@
+From 29aec558d7252fa58dc8de3f9696f99b5c3eeb42 Mon Sep 17 00:00:00 2001
+From: vhaudiquet <vhaudiquet@localhost>
+Date: Sun, 30 Aug 2026 01:27:18 +0200
+Subject: [PATCH 01/21] arm: mediatek: add MT8183 kukui krane board support
+
+Add support for the Lenovo IdeaPad Duet (google,krane sku176), an
+MT8183 ChromeOS tablet from the kukui family. The board boots through
+coreboot + depthcharge, which load U-Boot as an arm64 Image at an
+arbitrary 2 MiB-aligned DRAM slot; keep CONFIG_POSITION_INDEPENDENT
+like the pumpkin target.
+
+The board shares the pumpkin's board file, renamed to mt8183.c since it
+is generic for the SoC. The defconfig uses the upstream devicetree from
+dts/upstream (CONFIG_OF_UPSTREAM) and drops the pumpkin-specific USB
+gadget/fastboot support for now.
+---
+ board/mediatek/mt8183/MAINTAINERS             |  6 ++
+ board/mediatek/mt8183/Makefile                |  2 +-
+ .../mt8183/{mt8183_pumpkin.c => mt8183.c}     |  0
+ configs/mt8183_kukui_krane_defconfig          | 76 +++++++++++++++++++
+ 4 files changed, 83 insertions(+), 1 deletion(-)
+ rename board/mediatek/mt8183/{mt8183_pumpkin.c => mt8183.c} (100%)
+ create mode 100644 configs/mt8183_kukui_krane_defconfig
+
+diff --git a/board/mediatek/mt8183/MAINTAINERS b/board/mediatek/mt8183/MAINTAINERS
+index a49995e1bfe..47ceb5d9579 100644
+--- a/board/mediatek/mt8183/MAINTAINERS
++++ b/board/mediatek/mt8183/MAINTAINERS
+@@ -4,3 +4,9 @@ S:	Maintained
+ F:	board/mediatek/mt8183
+ F:	include/configs/mt8183.h
+ F:	configs/mt8183_pumpkin_defconfig
++
++MT8183 Kukui Krane (Lenovo IdeaPad Duet)
++M:	Weijie Gao <weijie.gao@mediatek.com>
++M:	Igor Belwon <igor.belwon@mentallysanemainliners.org>
++S:	Maintained
++F:	configs/mt8183_kukui_krane_defconfig
+diff --git a/board/mediatek/mt8183/Makefile b/board/mediatek/mt8183/Makefile
+index 90b5b72323c..eb88dad0d0f 100644
+--- a/board/mediatek/mt8183/Makefile
++++ b/board/mediatek/mt8183/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier:	GPL-2.0
+ 
+-obj-y += mt8183_pumpkin.o
++obj-y += mt8183.o
+diff --git a/board/mediatek/mt8183/mt8183_pumpkin.c b/board/mediatek/mt8183/mt8183.c
+similarity index 100%
+rename from board/mediatek/mt8183/mt8183_pumpkin.c
+rename to board/mediatek/mt8183/mt8183.c
+diff --git a/configs/mt8183_kukui_krane_defconfig b/configs/mt8183_kukui_krane_defconfig
+new file mode 100644
+index 00000000000..85c327f87dd
+--- /dev/null
++++ b/configs/mt8183_kukui_krane_defconfig
+@@ -0,0 +1,76 @@
++CONFIG_ARM=y
++CONFIG_COUNTER_FREQUENCY=13000000
++CONFIG_POSITION_INDEPENDENT=y
++CONFIG_ARCH_MEDIATEK=y
++CONFIG_TEXT_BASE=0x4c000000
++CONFIG_SYS_MALLOC_F_LEN=0x4000
++CONFIG_NR_DRAM_BANKS=1
++CONFIG_ENV_SIZE=0x1000
++CONFIG_ENV_OFFSET=0x0
++CONFIG_DM_GPIO=y
++CONFIG_DEFAULT_DEVICE_TREE="mediatek/mt8183-kukui-krane-sku176"
++CONFIG_TARGET_MT8183=y
++CONFIG_SYS_LOAD_ADDR=0x4c000000
++CONFIG_DEBUG_UART_BASE=0x11002000
++CONFIG_OF_UPSTREAM=y
++CONFIG_DEBUG_UART_CLOCK=26000000
++# CONFIG_PSCI_RESET is not set
++CONFIG_DEBUG_UART=y
++# CONFIG_EFI_LOADER is not set
++# CONFIG_ANDROID_BOOT_IMAGE is not set
++CONFIG_FIT=y
++# CONFIG_ARCH_FIXUP_FDT_MEMORY is not set
++CONFIG_USE_BOOTCOMMAND=y
++CONFIG_BOOTCOMMAND="run distro_bootcmd"
++CONFIG_DEFAULT_FDT_FILE="mt8183-kukui-krane-sku176"
++CONFIG_SYS_CBSIZE=256
++CONFIG_SYS_PBSIZE=276
++# CONFIG_DISPLAY_BOARDINFO is not set
++CONFIG_HUSH_PARSER=y
++# CONFIG_CMD_BDI is not set
++# CONFIG_CMD_CONSOLE is not set
++# CONFIG_CMD_BOOTD is not set
++# CONFIG_CMD_BOOTI is not set
++# CONFIG_CMD_ELF is not set
++# CONFIG_CMD_GO is not set
++# CONFIG_CMD_IMI is not set
++CONFIG_BOOTDELAY=-1
++# CONFIG_CMD_XIMG is not set
++# CONFIG_CMD_EXPORTENV is not set
++# CONFIG_CMD_IMPORTENV is not set
++# CONFIG_CMD_EDITENV is not set
++# CONFIG_CMD_CRC32 is not set
++CONFIG_SYS_WHITE_ON_BLACK=y
++# CONFIG_CMD_MEMORY is not set
++CONFIG_CMD_CLK=y
++CONFIG_CMD_GPT=y
++# CONFIG_CMD_LOADB is not set
++# CONFIG_CMD_LOADS is not set
++CONFIG_CMD_MMC=y
++CONFIG_CMD_PART=y
++# CONFIG_CMD_ITEST is not set
++# CONFIG_CMD_SETEXPR is not set
++# CONFIG_CMD_BLOCK_CACHE is not set
++CONFIG_CMD_SYSBOOT=y
++CONFIG_CMD_EXT4=y
++CONFIG_CMD_FAT=y
++CONFIG_CMD_FS_GENERIC=y
++# CONFIG_DOS_PARTITION is not set
++CONFIG_ENV_IS_IN_MMC=y
++CONFIG_ENV_MMC_EMMC_HW_PARTITION=2
++CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG=y
++CONFIG_CLK=y
++CONFIG_VIDEO=y
++CONFIG_VIDEO_MT8183_SCANOUT=y
++# CONFIG_INPUT is not set
++# CONFIG_MMC_QUIRKS is not set
++CONFIG_MMC_MTK=y
++# CONFIG_POWER is not set
++CONFIG_BAUDRATE=921600
++CONFIG_DM_SERIAL=y
++CONFIG_DEBUG_UART_ANNOUNCE=y
++CONFIG_MTK_SERIAL=y
++CONFIG_WDT=y
++CONFIG_WDT_MTK=y
++# CONFIG_RANDOM_UUID is not set
++# CONFIG_REGEX is not set
+-- 
+2.53.0
+

@@ -1,0 +1,104 @@
+From 8465a0cf8a676a98e214febe581ba499440f6e53 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Mon, 14 Sep 2026 00:51:09 +0200
+Subject: [PATCH] board: mediatek: mt8183: hand Linux the mtu3 view of SSUSB
+ from bootcmd
+
+The krane DT describes the single SSUSB block twice: the mtu3 wrapper
+(/soc/usb@11201000 -- the Linux view, whose parent owns the shared
+IPPC register block) and its xHCI child (/soc/usb@11201000/
+usb@11200000), which carries an extra "ippc" reg entry so U-Boot's
+xhci-mtk driver finds the IPPC it needs.  The two shapes cannot
+coexist in the kernel: with the child keeping its ippc reg, the
+kernel's xhci-mtk on the child deterministically fails to request the
+region the mtu3 parent already claimed (-EBUSY) and USB never comes
+up; without mtu3 claiming it, the two drivers instead race for it at
+probe, making USB work per boot.
+
+Fix the handoff instead.  From bootcmd -- after preboot's usb start,
+where U-Boot has finished probing (its xhci-mtk needs the child's
+ippc), so the property changes, which splice the FDT structure block,
+are safe:
+
+  - echo marker: prints the bootcmd version on every boot, so a stale
+    payload on the boot media is visible at a glance.
+  - fdt set ... compatible mediatek,mt8183-mtu3 mediatek,mtu3: the
+    parent node is also "simple-mfd", and without removing that
+    string the kernel populates the child xHCI device at boot.
+    Whenever its driver binds before mtu3 probed, the child starts
+    with has_ippc=false against an unpowered host IP -- "USB0 root
+    hub has no ports", all USB dead for the boot, no retry.
+    (mtu3's own probe can defer and retry, so module load order in
+    the initramfs cannot fix this race.)  Note this must be a value
+    rewrite, not "fdt rm": simple-mfd is a string inside
+    "compatible", not a property.
+  - fdt set ... reg/reg-names: reshape the child to mac-only, and
+    fdt rm ... phys: drop the T-PHY list the -u-boot.dtsi overlay put
+    on the child for U-Boot's own xhci-mtk.  Upstream the phys belong
+    to the mtu3 parent; left on the child, the kernel's xhci-mtk gets
+    the same two PHYs a second time and init/powers them behind the
+    parent's back.  phy_init() and phy_power_on() are refcounted so
+    this is benign today, but it is not the shape the kernel expects
+    and it makes the child's teardown asymmetric with the parent's.
+
+When the kernel's mtu3 later probes, ssusb_host_setup powers the host
+IP and of_platform_populate creates the child at that point; it binds
+the already-loaded xhci driver immediately, with the ports the parent
+enabled.  bootefi then hands exactly this blob to the kernel as its
+device tree, and U-Boot keeps using its own xHCI as before (the parent
+still matches the mtu3 driver without the simple-mfd string).
+
+The edit lives in krane.env rather than C on purpose: last_stage_init
+runs BEFORE preboot, where the same splices would corrupt the tree of
+the not-yet-probed USB stack.
+---
+ board/mediatek/mt8183/krane.env | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/board/mediatek/mt8183/krane.env b/board/mediatek/mt8183/krane.env
+index e9e8bd4ecbe..73d5c1bf3a6 100644
+--- a/board/mediatek/mt8183/krane.env
++++ b/board/mediatek/mt8183/krane.env
+@@ -1,3 +1,39 @@
+ stdin=serial,usbkbd
+ stdout=serial,vidconsole
+ stderr=serial,vidconsole
++
++/*
++ * The single SSUSB block is described twice: the mtu3 wrapper
++ * (/soc/usb@11201000, the Linux view: the parent owns the shared IPPC
++ * block) and its xHCI child (/soc/usb@11201000/usb@11200000, which
++ * carries an extra ippc reg entry for U-Boot's xhci-mtk driver).  When
++ * Linux sees the child WITH ippc, its xhci-mtk deterministically fails
++ * to request the region the mtu3 parent already owns -> no host
++ * controller -> no USB.
++ *
++ * Hand Linux the upstream shape instead, and make the bring-up
++ * self-serializing:
++ *
++ *   - rewrite the parent's "compatible" without its "simple-mfd"
++ *     string: with it, the kernel populates the child xHCI device at
++ *     boot, and whenever its driver binds before mtu3 probed, the
++ *     child starts with has_ippc=false against an unpowered host IP --
++ *     "USB0 root hub has no ports", all USB dead for the boot, no
++ *     retry.
++ *   - reshape the child to mac-only ("ippc" reg entry removed), and
++ *     drop the "phys" list the overlay added for U-Boot's xhci-mtk:
++ *     upstream the T-PHYs hang off the mtu3 parent, and leaving them
++ *     on the child has the kernel's xhci-mtk init and power the very
++ *     PHYs the parent already brought up.
++ *
++ * All three edits run from bootcmd, i.e. AFTER preboot's "usb start":
++ * U-Boot has finished probing by then (its xhci-mtk needs the child's
++ * ippc), so the property changes -- which splice the FDT structure
++ * block -- are safe here.  When the kernel's mtu3 later probes,
++ * ssusb_host_setup powers the host IP and of_platform_populate creates
++ * the child at that point; it binds the already-loaded xhci driver
++ * immediately, with the ports the parent enabled.  bootefi then hands
++ * exactly this blob to the kernel.  (The parent still matches the
++ * mtu3 driver without the simple-mfd string.)
++ */
++bootcmd=echo krane-bootcmd-v4 && fdt addr ${fdtcontroladdr} && fdt set /soc/usb@11201000 compatible mediatek,mt8183-mtu3 mediatek,mtu3 && fdt set /soc/usb@11201000/usb@11200000 reg '<0x0 0x11200000 0x0 0x1000>' && fdt set /soc/usb@11201000/usb@11200000 reg-names mac && fdt rm /soc/usb@11201000/usb@11200000 phys && bootefi bootmgr
+-- 
+2.53.0
+

@@ -1,0 +1,35 @@
+From 9f71fd279023d92474d48c6f1b3345bbbd9ca87e Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:22:04 +0200
+Subject: [PATCH 19/21] usb: xhci-mtk: shut the T-PHY down on remove
+
+xhci_mtk_remove() halted the controller, powered the host IP down and
+gated the clocks, but never called xhci_mtk_phy_shutdown(): the USB
+T-PHYs stayed powered and initialized at handoff while their consumer
+was gone.  ExitBootServices removes the controller via
+dm_remove_devices_active() (efi_exit_boot_services), so every EFI boot
+handed the OS a powered-on PHY that the next user (the Linux PHY
+driver) cold-brings-up over.  The probe error path already used
+xhci_mtk_phy_shutdown(); mirror it in remove, after the host IP is
+powered down.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ drivers/usb/host/xhci-mtk.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/host/xhci-mtk.c b/drivers/usb/host/xhci-mtk.c
+index ffe80c0bbdc..293cfc7e10a 100644
+--- a/drivers/usb/host/xhci-mtk.c
++++ b/drivers/usb/host/xhci-mtk.c
+@@ -345,6 +345,7 @@ static int xhci_mtk_remove(struct udevice *dev)
+ 
+ 	xhci_deregister(dev);
+ 	xhci_mtk_host_disable(mtk);
++	xhci_mtk_phy_shutdown(mtk);
+ 	xhci_mtk_ldos_disable(mtk);
+ 	clk_disable_bulk(&mtk->clks);
+ 
+-- 
+2.53.0
+

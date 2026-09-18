@@ -1,0 +1,232 @@
+From 5ec180345b46a78afe52d5d1830461f48cd671eb Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:08:23 +0200
+Subject: [PATCH 09/21] gpio: add MediaTek MT8183 GPIO driver
+
+Add a GPIO driver for the MT8183 GPIO controller at 0x10005000,
+covering the 192 pins in six 32-pin groups.  Each group owns a 16-byte
+window (value at +0, set at +4, reset at +8) for the DIR, DOUT and DIN
+registers, so output values and direction changes are performed
+atomically by writing the target bit to the set or reset register.
+The register layout was ported from the ChromeOS depthcharge driver
+src/drivers/gpio/mt8183.h (GpioRegs/GpioValRegs).
+
+Only the plain GPIO function is implemented.  The MT8183 multiplexes
+pads between several functions through per-pin mode registers which
+this driver does not touch; on the kukui family of boards every pad
+used as a GPIO at boot time (panel reset, panel power enables, the
+two display backlight controls) is already muxed to GPIO mode by the
+boot firmware before U-Boot runs.
+
+This is needed so that display drivers can drive the panel reset and
+panel power enable pads described in the device tree.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ MAINTAINERS                |   1 +
+ drivers/gpio/Kconfig       |   8 ++
+ drivers/gpio/Makefile      |   1 +
+ drivers/gpio/mt8183_gpio.c | 154 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 164 insertions(+)
+ create mode 100644 drivers/gpio/mt8183_gpio.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index eb48eea55c5..a7f5bc165ca 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -418,6 +418,7 @@ R:	GSS_MTK_Uboot_upstream <GSS_MTK_Uboot_upstream@mediatek.com>
+ T:	git https://git.u-boot-project.org/u-boot/custodians/u-boot-mediatek.git
+ S:	Maintained
+ F:	arch/arm/dts/mt*
++F:	drivers/gpio/mt8183_gpio.c
+ F:	drivers/power/domain/mt*
+ F:	drivers/power/regulator/mt*.c
+ F:	drivers/usb/mtu3/
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index a11f3043670..17a1f408413 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -772,3 +772,11 @@ config MPFS_GPIO
+ 	  Enable to support the GPIO driver on Polarfire SoC
+ 
+ endif
++
++config MT8183_GPIO
++	bool "MediaTek MT8183 GPIO driver"
++	depends on DM_GPIO && ARCH_MEDIATEK
++	help
++	  Say yes here to support the MediaTek MT8183 GPIO controller. Only
++	  the plain GPIO function is provided: pin mode multiplexing is the
++	  responsibility of the boot firmware.
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index 020e23c7252..fb7bc5dbd31 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -83,3 +83,4 @@ obj-$(CONFIG_GPIO_SCMI)		+= gpio_scmi.o
+ obj-$(CONFIG_$(PHASE_)ADP5585_GPIO)	+= adp5585_gpio.o
+ obj-$(CONFIG_RZG2L_GPIO)	+= rzg2l-gpio.o
+ obj-$(CONFIG_MPFS_GPIO)	+= mpfs_gpio.o
++obj-$(CONFIG_MT8183_GPIO)	+= mt8183_gpio.o
+diff --git a/drivers/gpio/mt8183_gpio.c b/drivers/gpio/mt8183_gpio.c
+new file mode 100644
+index 00000000000..d58d8026349
+--- /dev/null
++++ b/drivers/gpio/mt8183_gpio.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT8183 GPIO driver.
++ *
++ * Copyright (C) 2026 Vincent Haudiquet <vhaudiquet@gmail.com>
++ *
++ * Ported from the register layout of the ChromeOS depthcharge driver
++ * src/drivers/gpio/mt8183.h (GpioRegs/GpioValRegs), which is the same
++ * hardware the Linux pinctrl driver drivers/pinctrl/mediatek/
++ * pinctrl-mtk-mt8183.c drives through its common code.
++ *
++ * Only the plain GPIO function is supported: pin direction (DIR), output
++ * value (DOUT) and input value (DIN). The MT8183 multiplexes most pads
++ * between several functions through per-pin mode registers which this
++ * driver does not touch; the boot firmware is expected to have put the
++ * requested pads into GPIO mode already, which holds for every pad this
++ * platform uses as a GPIO at boot time.
++ *
++ * Each of the 192 pins lives in one of six 32-pin groups. Every group
++ * owns a 16-byte GpioValRegs window (value at +0, set at +4, reset at
++ * +8) for each of dir/dout/din, so bits are set or cleared atomically
++ * by writing the target bit to the set/reset register.
++ */
++
++#include <dm.h>
++#include <asm/io.h>
++#include <asm/gpio.h>
++#include <linux/bitops.h>
++#include <linux/sizes.h>
++
++#define GPIO_VAL_BITS		32
++#define GPIO_NUM_GROUPS		6
++#define GPIO_VAL_REGS_SIZE	16
++
++/* Offsets of the per-group GpioValRegs blocks within the controller. */
++#define GPIO_DIR_OFFSET		0x000
++#define GPIO_DOUT_OFFSET	0x100
++#define GPIO_DIN_OFFSET		0x200
++
++struct mt8183_gpio_priv {
++	void __iomem *base;
++};
++
++static void __iomem *mt8183_gpio_val_reg(struct mt8183_gpio_priv *priv,
++					 u32 offset, unsigned int pin, int val)
++{
++	unsigned int group = pin / GPIO_VAL_BITS;
++
++	return priv->base + offset + group * GPIO_VAL_REGS_SIZE + val * 4;
++}
++
++static int mt8183_gpio_direction_input(struct udevice *dev, unsigned int pin)
++{
++	struct mt8183_gpio_priv *priv = dev_get_priv(dev);
++
++	if (pin >= GPIO_VAL_BITS * GPIO_NUM_GROUPS)
++		return -EINVAL;
++
++	/* dir.reset clears the bit: the pad becomes an input. */
++	writel(BIT(pin % GPIO_VAL_BITS),
++	       mt8183_gpio_val_reg(priv, GPIO_DIR_OFFSET, pin, 2));
++
++	return 0;
++}
++
++static int mt8183_gpio_direction_output(struct udevice *dev, unsigned int pin,
++					int value)
++{
++	struct mt8183_gpio_priv *priv = dev_get_priv(dev);
++
++	if (pin >= GPIO_VAL_BITS * GPIO_NUM_GROUPS)
++		return -EINVAL;
++
++	/* dir.set sets the bit: the pad becomes an output. */
++	writel(BIT(pin % GPIO_VAL_BITS),
++	       mt8183_gpio_val_reg(priv, GPIO_DIR_OFFSET, pin, 1));
++	writel(BIT(pin % GPIO_VAL_BITS),
++	       mt8183_gpio_val_reg(priv, GPIO_DOUT_OFFSET, pin,
++				   value ? 1 : 2));
++
++	return 0;
++}
++
++static int mt8183_gpio_get_value(struct udevice *dev, unsigned int pin)
++{
++	struct mt8183_gpio_priv *priv = dev_get_priv(dev);
++
++	return !!(readl(mt8183_gpio_val_reg(priv, GPIO_DIN_OFFSET, pin, 0)) &
++		  BIT(pin % GPIO_VAL_BITS));
++}
++
++static int mt8183_gpio_set_value(struct udevice *dev, unsigned int pin,
++				 int value)
++{
++	struct mt8183_gpio_priv *priv = dev_get_priv(dev);
++
++	/* dout.set (val = 1) or dout.reset (val = 2) drives the pin. */
++	writel(BIT(pin % GPIO_VAL_BITS),
++	       mt8183_gpio_val_reg(priv, GPIO_DOUT_OFFSET, pin,
++				   value ? 1 : 2));
++
++	return 0;
++}
++
++static int mt8183_gpio_get_function(struct udevice *dev, unsigned int pin)
++{
++	struct mt8183_gpio_priv *priv = dev_get_priv(dev);
++
++	if (pin >= GPIO_VAL_BITS * GPIO_NUM_GROUPS)
++		return GPIOF_UNUSED;
++
++	if (readl(mt8183_gpio_val_reg(priv, GPIO_DIR_OFFSET, pin, 0)) &
++	    BIT(pin % GPIO_VAL_BITS))
++		return GPIOF_OUTPUT;
++
++	return GPIOF_INPUT;
++}
++
++static const struct dm_gpio_ops mt8183_gpio_ops = {
++	.direction_input	= mt8183_gpio_direction_input,
++	.direction_output	= mt8183_gpio_direction_output,
++	.get_value		= mt8183_gpio_get_value,
++	.set_value		= mt8183_gpio_set_value,
++	.get_function		= mt8183_gpio_get_function,
++};
++
++static int mt8183_gpio_probe(struct udevice *dev)
++{
++	struct gpio_dev_priv *uc_priv = dev_get_uclass_priv(dev);
++	struct mt8183_gpio_priv *priv = dev_get_priv(dev);
++
++	priv->base = dev_read_addr_ptr(dev);
++	if (!priv->base)
++		return -EINVAL;
++
++	uc_priv->gpio_count = GPIO_VAL_BITS * GPIO_NUM_GROUPS;
++	uc_priv->bank_name = "pio";
++
++	return 0;
++}
++
++static const struct udevice_id mt8183_gpio_ids[] = {
++	{ .compatible = "mediatek,mt8183-pinctrl" },
++	{ }
++};
++
++U_BOOT_DRIVER(mt8183_gpio) = {
++	.name		= "mt8183_gpio",
++	.id		= UCLASS_GPIO,
++	.of_match	= mt8183_gpio_ids,
++	.probe		= mt8183_gpio_probe,
++	.ops		= &mt8183_gpio_ops,
++	.priv_auto	= sizeof(struct mt8183_gpio_priv),
++};
+-- 
+2.53.0
+

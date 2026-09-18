@@ -1,0 +1,87 @@
+From 202c2183f8a065062acac5373dfc088564543f58 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:06:10 +0200
+Subject: [PATCH 07/21] boot: image-fdt: treat duplicate region reservation as
+ a no-op
+
+boot_fdt_add_mem_rsv_regions() runs several times per boot: from
+lmb_reserve_common() with the control FDT, again with the kernel DTB
+from boot_get_fdt(), and once more from bootm with BOOTM_STATE_FDT.
+Board code can also feed it the same blob (MT8183 display hand-off,
+SMP park reservation).  The second pass over the same DTB re-reserves
+regions that are already in the LMB map, lmb_alloc_mem() then returns
+-EEXIST, and boot_fdt_handle_region() printed that as:
+
+  ERROR: reserving fdt memory region failed (addr=50000000
+         size=2900000 flags=2): -17
+
+This is noise: the scp no-map region was already reserved, which is
+exactly the state the code wants.  Any genuine failure (ENOMEM, overlap
+with different flags) still prints.
+
+Update test_boot_fdt_add_mem_rsv_regions(), which pinned the old error:
+re-reserving an already-reserved region is now a silent no-op.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ boot/image-fdt.c      | 13 +++++++++++++
+ test/boot/image_fdt.c |  9 ++-------
+ 2 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/boot/image-fdt.c b/boot/image-fdt.c
+index 9e0e0f93edd..b62d8ae2271 100644
+--- a/boot/image-fdt.c
++++ b/boot/image-fdt.c
+@@ -95,6 +95,19 @@ static void boot_fdt_handle_region(u64 addr, u64 size, u32 flags, bool free)
+ 		debug("   %s fdt memory region: addr=%llx size=%llx flags=%x\n",
+ 		      free ? "freed" : "reserved", (unsigned long long)addr,
+ 		      (unsigned long long)size, flags);
++	} else if (ret == -EEXIST) {
++		/*
++		 * The region is already reserved by an earlier pass:
++		 * boot_fdt_add_mem_rsv_regions() runs several times per
++		 * boot (LMB init, boot_get_fdt(), BOOTM_STATE_FDT() and
++		 * board hand-off code), processing the same or overlapping
++		 * DTBs. A duplicate reservation is a no-op: the region is
++		 * already protected, which is all this code is here for.
++		 */
++		debug("   %s fdt memory region already reserved: addr=%llx size=%llx flags=%x\n",
++		      free ? "freed" : "reserved",
++		      (unsigned long long)addr, (unsigned long long)size,
++		      flags);
+ 	} else {
+ 		printf("ERROR: %s fdt memory region failed (addr=%llx size=%llx flags=%x): %ld\n",
+ 		       free ? "freeing" : "reserving", (unsigned long long)addr,
+diff --git a/test/boot/image_fdt.c b/test/boot/image_fdt.c
+index 5417689a683..21c4350f846 100644
+--- a/test/boot/image_fdt.c
++++ b/test/boot/image_fdt.c
+@@ -20,13 +20,9 @@
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+ /**
+- * test_boot_fdt_add_mem_rsv_regions - Make sure dt reservations are created and
+- *                                     destroyed correctly
+- * @uts: Test state
+- *
+  * This test depends on the UT_DM device tree and ensures the following
+  * statements hold true: The default reservation in test.dtb exists.
+- * Re-reserving that region will result in an error. Loading a new device tree
++ * Re-reserving that region is a silent no-op. Loading a new device tree
+  * will remove old reservations.
+  */
+ static int test_boot_fdt_add_mem_rsv_regions(struct unit_test_state *uts)
+@@ -41,9 +37,8 @@ static int test_boot_fdt_add_mem_rsv_regions(struct unit_test_state *uts)
+ 	/* Default reservation should exist */
+ 	ut_asserteq(1, lmb_is_reserved_flags(start, LMB_NOMAP));
+ 
+-	/* Attempting to re-reserve should warn the user */
++	/* Re-reserving an already reserved region is a silent no-op */
+ 	boot_fdt_add_mem_rsv_regions(gd->fdt_blob);
+-	ut_assert_nextlinen("ERROR: reserving");
+ 	ut_assert_console_end();
+ 
+ 	/* Loading a new_blob device tree should be allowed */
+-- 
+2.53.0
+

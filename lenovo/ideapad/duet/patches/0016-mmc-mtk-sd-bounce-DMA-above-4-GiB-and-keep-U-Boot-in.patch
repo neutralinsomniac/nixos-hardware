@@ -1,0 +1,80 @@
+From 1fa58b4478b354d0e34d053bd9e0fa21324c8506 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:22:03 +0200
+Subject: [PATCH 16/21] mmc: mtk-sd: bounce DMA above 4 GiB and keep U-Boot
+ inside the 32-bit window
+
+With the real 4 GiB DRAM size reported, both U-Boot's relocation target
+and EFI page allocations move above 0x100000000 -- and the msdc DMA
+engine only addresses 32 bits: bootefi bootmgr could no longer read the
+ESP from eMMC ("Cannot load any image").
+
+Keep U-Boot's own allocations inside the first 4 GiB by capping
+board_get_usable_ram_top(), and bounce DMA transfers of upper-DRAM
+buffers through a heap buffer in msdc_dma_transfer().  The OS still
+receives the full 4 GiB through the EFI memory map.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ drivers/mmc/mtk-sd.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/mmc/mtk-sd.c b/drivers/mmc/mtk-sd.c
+index 51c9c0a3fad..986d6625217 100644
+--- a/drivers/mmc/mtk-sd.c
++++ b/drivers/mmc/mtk-sd.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <clk.h>
++#include <asm/cache.h>
+ #include <cpu_func.h>
+ #include <dm.h>
+ #include <mmc.h>
+@@ -806,6 +807,7 @@ static int msdc_dma_transfer(struct msdc_host *host, struct mmc_data *data)
+ 	u32 size, status;
+ 	int ret;
+ 	const void *buf;
++	void *bounce = NULL;
+ 	enum dma_data_direction dir;
+ 	dma_addr_t dma_addr;
+ 
+@@ -818,6 +820,22 @@ static int msdc_dma_transfer(struct msdc_host *host, struct mmc_data *data)
+ 		dir = DMA_FROM_DEVICE;
+ 	}
+ 
++	/*
++	 * The DMA source address register (dma_sa) is 32 bits wide, so
++	 * transfers from buffers placed above 4 GiB would silently
++	 * truncate. With the real DRAM size reported, U-Boot relocation
++	 * stays below 4 GiB, but EFI page allocations still come from the
++	 * upper DRAM: bounce those transfers through a heap buffer.
++	 */
++	if ((uintptr_t)buf >= 0x100000000ULL) {
++		bounce = memalign(ARCH_DMA_MINALIGN, size);
++		if (!bounce)
++			return -ENOMEM;
++		if (data->flags == MMC_DATA_WRITE)
++			memcpy(bounce, buf, size);
++		buf = bounce;
++	}
++
+ 	dma_addr = msdc_flush_membuf(buf, size, dir);
+ 	msdc_dma_start(host, dma_addr, size);
+ 
+@@ -835,6 +853,12 @@ static int msdc_dma_transfer(struct msdc_host *host, struct mmc_data *data)
+ 	if (data->flags & MMC_DATA_READ)
+ 		invalidate_dcache_range(dma_addr, dma_addr + size);
+ 
++	if (bounce) {
++		if (data->flags & MMC_DATA_READ)
++			memcpy(data->dest, bounce, size);
++		free(bounce);
++	}
++
+ 	return msdc_dma_done(host, status);
+ }
+ 
+-- 
+2.53.0
+

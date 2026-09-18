@@ -1,0 +1,69 @@
+From b8f7c4a0cb06072433bc9d019288bc3ff9f92b50 Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:22:04 +0200
+Subject: [PATCH 18/21] arm64: dts: mt8183: krane: describe the SSUSB block for
+ U-Boot's xhci driver
+
+The upstream mt8183.dtsi models the SSUSB block for the Linux mtu3
+dual-role driver: the IPPC register space and the phys live on the
+parent mtu3 node while the xhci child has only its "mac" register.
+U-Boot binds the "mediatek,mtk-xhci" child directly and expects
+mac+ippc and a phys list on that node, so add a board -u-boot.dtsi
+overlay (auto-included after the upstream dts) that supplies them.  No
+upstream DT files are modified.
+
+Also add "simple-mfd" to the ssusb compatible in the overlay: DM scans
+only the immediate subnodes of a bound node, and nothing in U-Boot
+binds the "mediatek,mtu3" ssusb@11201000 node, so its xhci child
+(usb@11200000) was never bound, no UCLASS_USB device existed and
+usb start() reported "No USB controllers found".  The generic
+simple-bus driver binds the node and scans its children.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ .../dts/mt8183-kukui-krane-sku176-u-boot.dtsi | 33 +++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+ create mode 100644 arch/arm/dts/mt8183-kukui-krane-sku176-u-boot.dtsi
+
+diff --git a/arch/arm/dts/mt8183-kukui-krane-sku176-u-boot.dtsi b/arch/arm/dts/mt8183-kukui-krane-sku176-u-boot.dtsi
+new file mode 100644
+index 00000000000..daf4f8b8996
+--- /dev/null
++++ b/arch/arm/dts/mt8183-kukui-krane-sku176-u-boot.dtsi
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
++/*
++ * U-Boot-only additions for the MT8183 Kukui (krane) boards.
++ *
++ * The upstream mt8183.dtsi models the SSUSB block for the Linux mtu3
++ * dual-role driver: the IPPC register space and the phys are declared
++ * on the parent "mediatek,mtu3" node (ssusb@11201000), and the host
++ * child (usb@11200000) carries only its "mac" register.
++ *
++ * U-Boot has no mtu3 driver; it binds the "mediatek,mtk-xhci" child
++ * directly with drivers/usb/host/xhci-mtk.c, which expects the "mac"
++ * and "ippc" register names and a phys list on the xHCI node itself.
++ * Add the missing ippc address (taken from the ssusb node's "ippc"
++ * reg entry) and the port phys there.
++ *
++ * DM only scans the subnodes of nodes that a driver binds (bus drivers
++ * recurse via dm_scan_fdt_dev). Nothing binds "mediatek,mtu3", so the
++ * xHCI child would never be bound and usb_start() would report "No USB
++ * controllers found". Adding "simple-mfd" makes the generic simple-bus
++ * driver bind the ssusb node and scan its children.
++ */
++
++&ssusb {
++	compatible = "mediatek,mt8183-mtu3", "mediatek,mtu3", "simple-mfd";
++};
++
++&usb_host {
++	reg = <0x0 0x11200000 0x0 0x1000>,
++	      <0x0 0x11203e00 0x0 0x0100>;
++	reg-names = "mac", "ippc";
++	phys = <&u2port0 PHY_TYPE_USB2>,
++	       <&u3port0 PHY_TYPE_USB3>;
++};
+-- 
+2.53.0
+

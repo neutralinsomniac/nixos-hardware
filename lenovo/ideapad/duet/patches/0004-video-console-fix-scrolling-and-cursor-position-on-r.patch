@@ -1,0 +1,81 @@
+From 9034edf01d0b8471aca0d4d9656710425c67f2fd Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:05:53 +0200
+Subject: [PATCH 04/21] video: console: fix scrolling and cursor position on
+ rotated consoles
+
+Two bugs in the odd-rotation (rot=1/rot=3) console paths, where the
+console rows advance along the physical X axis by the font height:
+
+vidconsole_newline() compared the scroll condition against the font
+*width* (priv->x_charsize) instead of the font height, unlike the even-
+rotation branch.  The condition is only met at the bottom boundary when
+(xsize % font_height) < font_width; with CONFIG_VIDEO_FONT_16X32 on a
+1200x1920 panel driven with rot=3 (xsize % 32 == 16 == font_width) it is
+never true, so the console fills the visible rows and then keeps
+drawing past the right screen edge, corrupting the following scanout
+line (and past the framebuffer allocation on the last scanout line),
+with no visible scrolling.  Use priv->y_charsize, matching the
+even-rotation branch.
+
+vidconsole_position_cursor() converts a cell coordinate to pixels and
+clamps it against vid_priv->xsize / ysize, but on a rotated display the
+console axes are swapped: the putc_xy handlers of console_rotate.c
+interpret the x cursor along the ysize axis.  Clamping against the raw
+framebuffer dimensions truncates every column past xsize / x_charsize
+cells onto the same pixel.  Clamp against the swapped axis instead.
+
+The second bug is hit through the ANSI cursor-position escape (CUP,
+ESC[y;xH), which the EFI simple text output protocol translates every
+SetCursorPosition call into: on a 1200x1920 portrait panel with rot=3
+and a 16x32 font (120x37 console) anything GRUB positions at column >=
+75, e.g. the right border of its boot menu box, rendered 1200 px into
+the 1920 px scanout.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ drivers/video/vidconsole-uclass.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/vidconsole-uclass.c b/drivers/video/vidconsole-uclass.c
+index f1b2d61bd8f..314012ec5db 100644
+--- a/drivers/video/vidconsole-uclass.c
++++ b/drivers/video/vidconsole-uclass.c
+@@ -95,7 +95,7 @@ static void vidconsole_newline(struct udevice *dev)
+ 
+ 	/* Check if we need to scroll the terminal */
+ 	if (vid_priv->rot % 2 ?
+-	    priv->ycur + priv->x_charsize > vid_priv->xsize :
++	    priv->ycur + priv->y_charsize > vid_priv->xsize :
+ 	    priv->ycur + priv->y_charsize > vid_priv->ysize) {
+ 		vidconsole_move_rows(dev, 0, rows, priv->rows - rows);
+ 		for (i = 0; i < rows; i++)
+@@ -799,8 +799,23 @@ void vidconsole_position_cursor(struct udevice *dev, unsigned col, unsigned row)
+ 	struct video_priv *vid_priv = dev_get_uclass_priv(vid_dev);
+ 	short x, y;
+ 
+-	x = min_t(short, col * priv->x_charsize, vid_priv->xsize - 1);
+-	y = min_t(short, row * priv->y_charsize, vid_priv->ysize - 1);
++	/*
++	 * On a rotated display the text cursor advances along the
++	 * framebuffer axis that was swapped by the console probe: for
++	 * odd rotations (90/270 degrees) columns run along ysize and
++	 * rows along xsize. Clamp against that axis, not against the
++	 * raw framebuffer dimensions, or every cursor position past
++	 * xsize / x_charsize cells collapses onto the same pixel and
++	 * output positioned there (e.g. a bootmenu's right border)
++	 * renders in the middle of the screen.
++	 */
++	if (vid_priv->rot % 2) {
++		x = min_t(short, col * priv->x_charsize, vid_priv->ysize - 1);
++		y = min_t(short, row * priv->y_charsize, vid_priv->xsize - 1);
++	} else {
++		x = min_t(short, col * priv->x_charsize, vid_priv->xsize - 1);
++		y = min_t(short, row * priv->y_charsize, vid_priv->ysize - 1);
++	}
+ 	vidconsole_set_cursor_pos(dev, x, y);
+ }
+ 
+-- 
+2.53.0
+

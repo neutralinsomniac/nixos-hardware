@@ -1,0 +1,1500 @@
+From 05416a31effbb63e8a24fd0b5946dd724f73592d Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:16:45 +0200
+Subject: [PATCH 12/21] video: add MT8183 cold display bring-up for krane with
+ BOE panel
+
+Bring up the krane (MT8183) display from a cold start in U-Boot,
+instead of reviving the scanout the boot firmware left running:
+
+- mt8183_display.c: OVL pipeline setup, staged bring-up (clocks,
+  panel, DSI init, DSI enable, pipeline), framebuffer allocation from
+  the top of the DRAM window the control FDT describes, rotated
+  console via the panel rotation, dcache flush for the DMA-scanned
+  framebuffer, and a firmware-handoff fallback when a stage fails.
+  If the pipeline comes up, a probe banner reports the geometry and
+  the bring-up time.
+- mt8183_disp.c/h: OVL/mutex/MMSYS register helpers and handoff
+  scanout discovery.
+- panel_boe_tv101wum.c: BOE TV101WUM-NL6 panel driver with the DCS
+  init sequence.
+
+The framebuffer is protected with the same scheme as the display
+hand-off: fdt_add_mem_rsv() in the control FDT plus
+boot_fdt_add_mem_rsv_regions(), which feeds LMB; LMB reservations are
+notified into the EFI memory map, so EFI page allocations skip the
+region too, and the /memreserve/ entry is honored by the kernel
+regardless of which DTB ends up being used (GRUB commonly loads its
+own devicetree file, which defeats a /memory reg trim).  The
+allocation itself goes through lmb_alloc_mem() from the top of the
+/memory window; a failed reservation fails the pipeline stage so
+probe falls back to the firmware-handoff path instead of scanning out
+of an unprotected framebuffer.
+
+Verified on hardware: cold bring-up, EFI boot to grub and kernel.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ MAINTAINERS                        |   4 +
+ drivers/video/Kconfig              |  38 ++
+ drivers/video/Makefile             |   2 +
+ drivers/video/mt8183_disp.c        | 183 ++++++++++
+ drivers/video/mt8183_disp.h        |  98 ++++++
+ drivers/video/mt8183_display.c     | 542 +++++++++++++++++++++++++++++
+ drivers/video/panel_boe_tv101wum.c | 515 +++++++++++++++++++++++++++
+ 7 files changed, 1382 insertions(+)
+ create mode 100644 drivers/video/mt8183_disp.c
+ create mode 100644 drivers/video/mt8183_disp.h
+ create mode 100644 drivers/video/mt8183_display.c
+ create mode 100644 drivers/video/panel_boe_tv101wum.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 04940dfc6ee..ece3cd1886c 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -424,6 +424,10 @@ F:	drivers/power/domain/mt*
+ F:	drivers/power/regulator/mt*.c
+ F:	drivers/usb/mtu3/
+ F:	drivers/video/mtk_dsi.c
++F:	drivers/video/mt8183_disp.c
++F:	drivers/video/mt8183_disp.h
++F:	drivers/video/mt8183_display.c
++F:	drivers/video/panel_boe_tv101wum.c
+ F:	include/power/mt*.h
+ N:	mediatek
+ N:	mtk
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index b42c3c565fb..3cd3d69449e 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -1022,6 +1022,36 @@ config VIDEO_MCDE_SIMPLE
+ 	  before u-boot starts, and u-boot will simply render to the pre-
+ 	  allocated frame buffer surface.
+ 
++choice
++	prompt "MT8183 display driver"
++	depends on ARCH_MEDIATEK
++	help
++	  Selects the driver that drives the display pipeline on MT8183
++	  boards. Leave unset to run without any MT8183 display driver
++	  (serial console only; the pipeline stays as the boot firmware
++	  left it).
++
++config VIDEO_MT8183_DISPLAY
++	bool "Enable MT8183 display pipeline bring-up driver"
++	depends on VIDEO_MIPI_DSI && PANEL && PHY
++	select VIDEO_MTK_DSI
++	select PHY_MTK_MIPI_TX
++	select PANEL_BOE_TV101WUM
++	help
++	  Enables a display driver for the MediaTek MT8183 that brings the
++	  full display pipeline up from scratch: MMSYS display clock gates,
++	  MIPI TX D-PHY, MIPI DSI host, panel initialization (BOE
++	  TV101WUM-NL6 and friends on the kukui family), overlay scanout of
++	  an U-Boot-allocated framebuffer and backlight. The framebuffer is
++	  placed outside the DRAM window described by the control device
++	  tree and reserved in the FDT and LMB.
++
++	  If the pipeline fails to come up, the driver falls back to
++	  reviving the pipeline left running by the boot firmware and
++	  reports which path was taken.
++
++endchoice
++
+ config OSD
+ 	bool "Enable OSD support"
+ 	depends on DM
+@@ -1437,3 +1467,11 @@ config VIDEO_MTK_DSI
+ 	  video mode to stream out pixels. It relies on the MMSYS display
+ 	  gates being available through the clock framework and on the
+ 	  MT8183 MIPI TX D-PHY (PHY_MTK_MIPI_TX).
++
++config PANEL_BOE_TV101WUM
++	bool "Enable BOE TV101WUM-NL6 DSI panel driver"
++	depends on PANEL && VIDEO_MIPI_DSI
++	help
++	  Say Y here if you want to enable support for the BOE
++	  TV101WUM-NL6 MIPI DSI panel (1200x1920, 4 data lanes), used in
++	  the Lenovo IdeaPad Duet (google,krane) and other devices.
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index 15c598a437a..a15b6504896 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -80,6 +80,7 @@ obj-$(CONFIG_VIDEO_LCD_SAMSUNG_S6E63M0) += samsung-s6e63m0.o
+ obj-$(CONFIG_VIDEO_MCDE_SIMPLE) += mcde_simple.o
+ obj-${CONFIG_VIDEO_MESON} += meson/
+ obj-${CONFIG_VIDEO_MIPI_DSI} += mipi_dsi.o
++obj-$(CONFIG_VIDEO_MT8183_DISPLAY) += mt8183_display.o mt8183_disp.o
+ obj-$(CONFIG_VIDEO_MVEBU) += mvebu_lcd.o
+ obj-$(CONFIG_VIDEO_MXS) += mxsfb.o videomodes.o
+ obj-$(CONFIG_VIDEO_NX) += nexell_display.o videomodes.o nexell/
+@@ -95,3 +96,4 @@ obj-y += bridge/
+ obj-y += sunxi/
+ obj-y += tegra/
+ obj-$(CONFIG_VIDEO_MTK_DSI) += mtk_dsi.o
++obj-$(CONFIG_PANEL_BOE_TV101WUM) += panel_boe_tv101wum.o
+diff --git a/drivers/video/mt8183_disp.c b/drivers/video/mt8183_disp.c
+new file mode 100644
+index 00000000000..df73fb3d5c9
+--- /dev/null
++++ b/drivers/video/mt8183_disp.c
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT8183 display helpers shared by the display drivers.
++ *
++ * Copyright (C) 2026 Vincent Haudiquet <vhaudiquet@gmail.com>
++ *
++ * The firmware-handoff model documented here applies to the MT8183 kukui
++ * family of ChromeOS devices (e.g. the Lenovo IdeaPad Duet,
++ * "google,krane"): the display pipeline (MMSYS -> OVL0 -> OVL0_2L ->
++ * RDMA -> COLOR -> DSI -> panel) is fully initialized and running by the
++ * time control is passed to the next boot stage, but depthcharge's
++ * display_cleanup() disables the overlay engines and turns the backlight
++ * off right before jumping to the payload.
++ */
++
++#include <dm.h>
++#include <image.h>
++#include <video.h>
++#include <asm/io.h>
++#include <asm/system.h>
++#include <asm/unaligned.h>
++#include <linux/bitops.h>
++#include <linux/kernel.h>
++#include <linux/sizes.h>
++
++#include "mt8183_disp.h"
++
++/*
++ * OVL0 register offsets. Source: Linux drivers/gpu/drm/mediatek/
++ * mtk_disp_ovl.c (DISP_REG_OVL_EN) and device-era depthcharge
++ * src/drivers/video/mtk_ddp.c (ChromeOS R93, the generation shipped on
++ * kukui); both agree on 0x000c for OVL_EN. The 2L sub-engine enable
++ * (DISP_REG_OVL0_2L_EN) lives in the same register block on MT8183.
++ * The layer-0 source address register (DISP_REG_OVL_L0_ADDR) is not reset
++ * by depthcharge's stop() and holds the live scanout address.
++ */
++#define DISP_REG_OVL_L0_ADDR	0x0f40
++#define DISP_REG_OVL_EN		0x000c
++#define DISP_REG_OVL0_2L_EN	0x100c
++
++#define LB_TAG_FRAMEBUFFER	0x12
++
++void mt8183_disp_enable_backlight(void)
++{
++	writel(MTK_GPIO_DOUT_BIT(PAD_DISP_PWM),
++	       (void __iomem *)MTK_GPIO_DOUT_SET(PAD_DISP_PWM));
++	writel(MTK_GPIO_DOUT_BIT(PAD_EN_LCD_BL),
++	       (void __iomem *)MTK_GPIO_DOUT_SET(PAD_EN_LCD_BL));
++}
++
++void mt8183_disp_disable_backlight(void)
++{
++	writel(MTK_GPIO_DOUT_BIT(PAD_DISP_PWM),
++	       (void __iomem *)MTK_GPIO_DOUT_CLEAR(PAD_DISP_PWM));
++	writel(MTK_GPIO_DOUT_BIT(PAD_EN_LCD_BL),
++	       (void __iomem *)MTK_GPIO_DOUT_CLEAR(PAD_EN_LCD_BL));
++}
++
++int mt8183_disp_find_framebuffer(u64 table,
++				 struct mt8183_lb_framebuffer *fb)
++{
++	void *base = (void *)(uintptr_t)table;
++	u32 header_bytes, entries, i;
++	void *rec;
++
++	if (get_unaligned_le32(base) != 0x4f49424c) /* "LBIO" */
++		return -ENOENT;
++
++	header_bytes = get_unaligned_le32(base + 4);
++	entries = get_unaligned_le32(base + 20);
++	if (header_bytes < 24 || header_bytes > 4096 ||
++	    entries == 0 || entries > 4096)
++		return -EINVAL;
++
++	rec = base + header_bytes;
++	for (i = 0; i < entries; i++) {
++		u32 tag = get_unaligned_le32(rec);
++		u32 rsize = get_unaligned_le32(rec + 4);
++
++		if (rsize < 8)
++			return -EINVAL;
++
++		if (tag == LB_TAG_FRAMEBUFFER) {
++			if (rsize < sizeof(*fb))
++				return -EINVAL;
++
++			memcpy(fb, rec, sizeof(*fb));
++			fb->physical_address =
++				get_unaligned_le64(rec + 8);
++			return 0;
++		}
++
++		rec += rsize;
++	}
++
++	return -ENOENT;
++}
++
++int mt8183_disp_setup_handoff(fdt_addr_t ovl, struct video_uc_plat *plat,
++			      struct video_priv *uc_priv)
++{
++	struct mt8183_lb_framebuffer fb;
++	u64 addr;
++	int ret;
++
++	/*
++	 * Revive the pipeline: undo depthcharge's display_cleanup() by
++	 * re-enabling the overlay engines and driving the backlight GPIOs
++	 * high. No panel or DSI re-initialization is needed: the panel is
++	 * powered and the DSI link stays up through the handoff.
++	 */
++	writel(1, ovl + DISP_REG_OVL_EN);
++	writel(1, ovl + DISP_REG_OVL0_2L_EN);
++	mt8183_disp_enable_backlight();
++
++	/*
++	 * The coreboot table sits above the DRAM window described by the
++	 * control DTB; map it before parsing.
++	 */
++	mmu_map_region(COREBOOT_TABLE_ADDR, SZ_4K, false);
++
++	ret = mt8183_disp_find_framebuffer(COREBOOT_TABLE_ADDR, &fb);
++	if (ret)
++		return log_msg_ret("lbio", ret);
++
++	if (fb.bits_per_pixel != 32 || fb.red_pos != 16 || fb.red_size != 8 ||
++	    fb.green_pos != 8 || fb.green_size != 8 ||
++	    fb.blue_pos != 0 || fb.blue_size != 8)
++		return log_msg_ret("fmt", -EOPNOTSUPP);
++
++	/*
++	 * Use the address from the coreboot table when it is a plausible
++	 * DRAM address (>= 1 GiB), otherwise fall back to the address the
++	 * firmware actually programmed into the overlay, which it left in
++	 * place across the handoff.
++	 */
++	addr = fb.physical_address;
++	if (addr < SZ_1G)
++		addr = readl(ovl + DISP_REG_OVL_L0_ADDR);
++
++	if (addr < SZ_1G)
++		return log_msg_ret("scanout", -ENODEV);
++
++	plat->base = addr;
++	plat->size = fb.bytes_per_line * fb.y_resolution;
++
++	/*
++	 * The scanout buffer was allocated by the boot firmware and is not
++	 * tracked by U-Boot's memory management. Without a reservation it
++	 * shows up as conventional RAM: once the kernel's page allocator
++	 * goes live it reuses the region and the display corrupts. Record a
++	 * memory reservation in the control FDT and feed it to LMB, so that
++	 * EFI page allocations skip it, the EFI DT fixup marks it reserved
++	 * in the memory map, and the kernel honors the /memreserve of the
++	 * DTB it receives.
++	 */
++	ret = fdt_add_mem_rsv((void *)gd->fdt_blob, plat->base, plat->size);
++	if (ret)
++		log_warning("FDT reservation for scanout buffer failed: %d\n",
++			    ret);
++	else
++		boot_fdt_add_mem_rsv_regions(gd->fdt_blob);
++
++	/* The scanout surface is above the DTB DRAM window: map it. */
++	mmu_map_region(plat->base, ALIGN(plat->size, SZ_4K), false);
++
++	uc_priv->bpix = VIDEO_BPP32;
++	uc_priv->xsize = fb.x_resolution;
++	uc_priv->ysize = fb.y_resolution;
++	uc_priv->line_length = fb.bytes_per_line;
++
++	/*
++	 * The BOE TV101WUM-NL6 panel is mounted rotated 270 degrees in
++	 * the krane chassis (see the panel node's "rotation" property in
++	 * the upstream DT). The keyboard-covered landscape orientation
++	 * therefore needs the console rotated; the uclass then binds the
++	 * rotated vidconsole3 text driver. rot=1 (90 degrees) was tried
++	 * first and read upside down on the device.
++	 */
++	uc_priv->rot = 3;
++
++	return 0;
++}
+diff --git a/drivers/video/mt8183_disp.h b/drivers/video/mt8183_disp.h
+new file mode 100644
+index 00000000000..635ee4325ab
+--- /dev/null
++++ b/drivers/video/mt8183_disp.h
+@@ -0,0 +1,98 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * MediaTek MT8183 display helpers shared by the display drivers.
++ *
++ * Copyright (C) 2026 Vincent Haudiquet <vhaudiquet@gmail.com>
++ */
++
++#ifndef _MT8183_DISP_H
++#define _MT8183_DISP_H
++
++#include <video.h>
++
++/*
++ * Backlight GPIOs. The MT8183 GPIO controller is at 0x10005000; the dout
++ * block starts at +0x100 with 16 bytes per 32-pin group and set@+4 and
++ * clear@+8 (layout of GpioRegs/GpioValRegs in device-era depthcharge
++ * src/drivers/gpio/mt8183.h). On kukui the backlight is driven by two
++ * dedicated GPIOs: DISP_PWM (pin 43) and EN_LCD_BL (PERIPHERAL_EN13, pin
++ * 176); depthcharge's kukui_backlight_update() drives both high to turn
++ * the backlight on.
++ */
++#define MTK_GPIO_BASE		0x10005000
++#define MTK_GPIO_DOUT_SET(pin)	(MTK_GPIO_BASE + 0x100 + ((pin) / 32) * 16 + 4)
++#define MTK_GPIO_DOUT_CLEAR(pin) (MTK_GPIO_BASE + 0x100 + ((pin) / 32) * 16 + 8)
++#define MTK_GPIO_DOUT_BIT(pin)	BIT((pin) % 32)
++#define PAD_DISP_PWM		43
++#define PAD_EN_LCD_BL		176
++
++/*
++ * The coreboot table sits at a fixed address on kukui: 0xffed9000, size
++ * 0x380 (coreboot memlayout; confirmed on the device through
++ * /sys/firmware/fdt and the coreboot sysfs tags).
++ */
++#define COREBOOT_TABLE_ADDR	0xffed9000
++
++struct mt8183_lb_framebuffer {
++	u32 tag;
++	u32 size;
++	u64 physical_address;
++	u32 x_resolution;
++	u32 y_resolution;
++	u32 bytes_per_line;
++	u8 bits_per_pixel;
++	u8 red_pos;
++	u8 red_size;
++	u8 green_pos;
++	u8 green_size;
++	u8 blue_pos;
++	u8 blue_size;
++	u8 reserved_pos;
++	u8 reserved_size;
++};
++
++/**
++ * mt8183_disp_enable_backlight() - drive the two kukui backlight GPIOs on
++ *
++ * Board glue for the krane backlight (DISP_PWM and EN_LCD_BL are plain
++ * GPIOs on this board; the upstream backlight node describes a PWM setup
++ * whose pin muxing the boot firmware already provides).
++ */
++void mt8183_disp_enable_backlight(void);
++
++/**
++ * mt8183_disp_disable_backlight() - drive the two kukui backlight GPIOs off
++ *
++ * Inverse of mt8183_disp_enable_backlight().
++ */
++void mt8183_disp_disable_backlight(void);
++
++/**
++ * mt8183_disp_find_framebuffer() - parse the coreboot table LBIO record
++ *
++ * Layout from coreboot src/commonlib/include/commonlib/coreboot_tables.h.
++ * physical_address == 0 is legitimate: upstream coreboot 4.14 (the
++ * generation shipped on kukui) publishes the framebuffer record with
++ * fb_addr=0; the live scanout address then comes from OVL_L0_ADDR.
++ */
++int mt8183_disp_find_framebuffer(u64 table,
++				 struct mt8183_lb_framebuffer *fb);
++
++/**
++ * mt8183_disp_setup_handoff() - revive the firmware pipeline and take over
++ * its scanout surface
++ *
++ * Re-enables the overlay engines and the backlight (undoing depthcharge's
++ * display_cleanup()), discovers the geometry and the live scanout address
++ * from the coreboot table framebuffer record (falling back to the OVL
++ * layer-0 address register, which still holds the address the firmware
++ * used), maps the surface and reserves it in the control FDT and LMB, and
++ * fills @plat and @uc_priv with the resulting geometry.
++ *
++ * @ovl: OVL0 base address (already mapped)
++ * Return: 0 if OK, -ve on error
++ */
++int mt8183_disp_setup_handoff(fdt_addr_t ovl, struct video_uc_plat *plat,
++			      struct video_priv *uc_priv);
++
++#endif
+diff --git a/drivers/video/mt8183_display.c b/drivers/video/mt8183_display.c
+new file mode 100644
+index 00000000000..8b0d100263c
+--- /dev/null
++++ b/drivers/video/mt8183_display.c
+@@ -0,0 +1,542 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT8183 display driver: full pipeline bring-up.
++ *
++ * Copyright (C) 2026 Vincent Haudiquet <vhaudiquet@gmail.com>
++ *
++ * On the MT8183 kukui family of ChromeOS devices (e.g. the Lenovo IdeaPad
++ * Duet, "google,krane") the display pipeline is
++ *
++ *   MMSYS -> OVL0 -> OVL0_2L -> RDMA0 -> COLOR0 -> CCORR0 -> AAL0 ->
++ *   GAMMA0 -> DITHER0 -> DSI0 -> panel
++ *
++ * This driver brings that pipeline up from scratch, ported from the
++ * ChromeOS coreboot port for this platform (src/soc/mediatek/mt8183/
++ * ddp.c, src/soc/mediatek/mt8183/include/soc/ddp.h and the mainboard
++ * display bring-up in src/mainboard/google/kukui/mainboard.c, all in
++ * coreboot 4.14, the generation shipped on these devices):
++ *
++ *   - enable the MMSYS free-run clock gates for the display engines and
++ *     take the SMI local arbiter out of the M4U domain (the OVL fetches
++ *     the framebuffer directly from DRAM in U-Boot),
++ *   - power and initialize the panel over DSI (panel uclass child of the
++ *     DSI controller node) and start the DSI video stream,
++ *   - route and enable the overlay chain, configure the overlay layer
++ *     for the framebuffer surface,
++ *   - turn the backlight on.
++ *
++ * If any stage fails (for example when the boot firmware has already
++ * shut the pipeline down in a way this sequence cannot recover), the
++ * driver falls back to reviving the pipeline left running by the boot
++ * firmware instead, and reports which path was taken.
++ */
++
++#include <dm.h>
++#include <dsi_host.h>
++#include <image.h>
++#include <lmb.h>
++#include <panel.h>
++#include <video.h>
++#include <asm/io.h>
++#include <time.h>
++#include <asm/system.h>
++#include <linux/bitops.h>
++#include <linux/ioport.h>
++#include <linux/kernel.h>
++#include <linux/sizes.h>
++
++#include "mt8183_disp.h"
++
++/*
++ * Base addresses of the display pipeline components. Source: coreboot
++ * 4.14 src/soc/mediatek/mt8183/include/soc/addressmap.h (IO_PHYS +
++ * offsets, matching the upstream device tree reg properties). MT8183 has
++ * a single MMSYS instance and one display path, so these are fixed for
++ * the SoC. Note the naming difference with coreboot, whose
++ * DISP_OVL1_BASE (0x14009000) is the OVL0_2L engine of the upstream
++ * device tree (node ovl_2l0@14009000).
++ */
++#define MMSYS_BASE		0x14000000
++#define DISP_OVL0_BASE		0x14008000
++#define DISP_OVL0_2L_BASE	0x14009000
++#define DISP_RDMA0_BASE		0x1400b000
++#define DISP_COLOR0_BASE	0x1400e000
++#define DISP_CCORR0_BASE	0x1400f000
++#define DISP_AAL0_BASE		0x14010000
++#define DISP_GAMMA0_BASE	0x14011000
++#define DISP_DITHER0_BASE	0x14012000
++#define DISP_DSI0_BASE		0x14014000
++#define DISP_MUTEX_BASE		0x14016000
++#define SMI_LARB0		0x14017000
++
++/*
++ * MMSYS free-run clock gates (1 = gated). Offsets and bit assignments
++ * from coreboot 4.14 src/soc/mediatek/mt8183/include/soc/ddp.h
++ * (mmsys_cg_con0 at 0x100, mmsys_cg_con1 at 0x110); the same bits are
++ * modeled as CLK_MM_* gate clocks by the clock framework.
++ */
++#define MMSYS_CG_CON0		0x100
++#define MMSYS_CG_CON1		0x110
++#define CG_CON0_DISP_ALL	(BIT(0) | BIT(1) | BIT(3) | BIT(4) | \
++				 BIT(20) | BIT(21) | BIT(23) | BIT(26) | \
++				 BIT(27) | BIT(28) | BIT(29) | BIT(30))
++#define CG_CON1_DISP_DSI0	(BIT(0) | BIT(1))
++
++/* MMSYS routing registers, from the coreboot ddp.h register map. */
++#define DISP_OVL0_MOUT_EN	0xf00
++#define DISP_OVL0_2L_MOUT_EN	0xf04
++#define DISP_DITHER0_MOUT_EN	0xf0c
++#define DISP_PATH0_SEL_IN	0xf24
++#define DSI0_SEL_IN		0xf2c
++#define DISP_RDMA0_SOUT_SEL_IN	0xf50
++
++#define OVL0_MOUT_EN_OVL0_2L	BIT(4)
++#define OVL0_2L_MOUT_EN_DISP_PATH0	BIT(0)
++#define DITHER0_MOUT_EN_DISP_DSI0	BIT(0)
++#define DISP_PATH0_SEL_IN_OVL0_2L	1
++#define DSI0_SEL_IN_DITHER0_MOUT	0
++#define RDMA0_SOUT_SEL_IN_COLOR		1
++
++/* DISP_MUTEX */
++#define DISP_REG_MUTEX_EN	0x0020
++#define DISP_REG_MUTEX_MOD	0x0030
++#define MUTEX_MOD_DISP_RDMA0	BIT(0)
++#define MUTEX_MOD_DISP_OVL0	BIT(9)
++#define MUTEX_MOD_DISP_OVL0_2L	BIT(10)
++#define MUTEX_MOD_DISP_COLOR0	BIT(13)
++#define MUTEX_MOD_DISP_CCORR0	BIT(14)
++#define MUTEX_MOD_DISP_AAL0	BIT(15)
++#define MUTEX_MOD_DISP_GAMMA0	BIT(16)
++#define MUTEX_MOD_DISP_DITHER0	BIT(17)
++#define MUTEX_MOD_MAIN_PATH	(MUTEX_MOD_DISP_OVL0 | \
++				 MUTEX_MOD_DISP_OVL0_2L | \
++				 MUTEX_MOD_DISP_RDMA0 | \
++				 MUTEX_MOD_DISP_COLOR0 | \
++				 MUTEX_MOD_DISP_CCORR0 | \
++				 MUTEX_MOD_DISP_AAL0 | \
++				 MUTEX_MOD_DISP_GAMMA0 | \
++				 MUTEX_MOD_DISP_DITHER0)
++#define MUTEX_SOF_DSI0		1
++
++/*
++ * OVL registers, from the coreboot ddp_common.h register map (struct
++ * disp_ovl_regs). MT8183 has 4-layer OVL engines; the main path uses
++ * layer 0 of OVL0 for the framebuffer.
++ */
++#define DISP_REG_OVL_EN		0x000c
++#define DISP_REG_OVL_ROI_SIZE	0x0020
++#define DISP_REG_OVL_DATAPATH_CON	0x0024
++#define DISP_REG_OVL_ROI_BGCLR	0x0028
++#define DISP_REG_OVL_SRC_CON	0x002c
++#define DISP_REG_OVL_L0_CON	0x0030
++#define DISP_REG_OVL_L0_SRC_SIZE	0x0038
++#define DISP_REG_OVL_L0_PITCH	0x0044
++#define DISP_REG_OVL_L0_RDMA_CTRL	0x0070
++#define DISP_REG_OVL_L0_RDMA_GMC	0x0078
++#define DISP_REG_OVL_L0_ADDR	0x0f40
++
++#define OVL_INFMT_RGBA8888	2
++#define RDMA_MEM_GMC		0x40402020
++
++/* DISP_RDMA0 registers, from the coreboot ddp_common.h register map. */
++#define DISP_REG_RDMA_GLOBAL_CON	0x0010
++#define DISP_REG_RDMA_SIZE_CON_0	0x0014
++#define DISP_REG_RDMA_SIZE_CON_1	0x0018
++#define DISP_REG_RDMA_FIFO_CON	0x0040
++#define RDMA_ENGINE_EN		BIT(0)
++#define RDMA_FIFO_UNDERFLOW_EN	BIT(31)
++#define RDMA_FIFO_PSEUDO_SIZE(bytes)	(((bytes) / 16) << 16)
++#define RDMA_OUTPUT_VALID_FIFO_THRESHOLD(bytes)	((bytes) / 16)
++
++/* DISP_COLOR0, from the coreboot ddp_common.h register map. */
++#define DISP_REG_COLOR_CFG_MAIN	0x0400
++#define DISP_REG_COLOR_START	0x0c00
++#define DISP_REG_COLOR_WIDTH	0x0c50
++#define DISP_REG_COLOR_HEIGHT	0x0c54
++#define COLOR_BYPASS_ALL	BIT(7)
++#define COLOR_SEQ_SEL		BIT(13)
++
++/*
++ * The display "post processing" blocks (CCORR/AAL/GAMMA/DITHER) share
++ * this layout (struct disp_pq_regs of the coreboot ddp.h): enable at
++ * +0x0, config at +0x1c, size at +0x30.
++ */
++#define DISP_REG_PQ_EN		0x0000
++#define DISP_REG_PQ_CFG		0x001c
++#define DISP_REG_PQ_SIZE	0x0030
++#define PQ_EN			BIT(0)
++#define PQ_RELAY_MODE		BIT(0)
++
++#define SMI_LARB_NON_SEC_CON	0x380
++
++/*
++ * The RDMA pseudo FIFO size: the mediatek,rdma-fifo-size property of the
++ * RDMA0 node in the upstream device tree (5 KiB, same value as the
++ * coreboot port passes to rdma_config()).
++ */
++#define RDMA_FIFO_SIZE		(5 * 1024)
++
++enum mt8183_disp_stage {
++	STAGE_CLOCKS,
++	STAGE_PANEL,
++	STAGE_DSI_INIT,
++	STAGE_DSI_ENABLE,
++	STAGE_PIPELINE,
++	STAGE_COUNT,
++};
++
++static const char *const stage_names[STAGE_COUNT] = {
++	"clocks", "panel", "dsi-init", "dsi-enable", "pipeline",
++};
++
++struct mt8183_display_priv {
++	struct udevice *dsi_host;
++	struct udevice *panel;
++	struct mipi_dsi_device device;
++	struct display_timing timing;
++};
++
++static void mt8183_disp_clock_on(void)
++{
++	void __iomem *mmsys = (void __iomem *)MMSYS_BASE;
++
++	clrbits_le32(mmsys + MMSYS_CG_CON0, CG_CON0_DISP_ALL);
++	clrbits_le32(mmsys + MMSYS_CG_CON1, CG_CON1_DISP_DSI0);
++
++	/*
++	 * Turn off the M4U port of SMI LARB0: the OVL reads DRAM
++	 * directly in U-Boot, without an IOMMU.
++	 */
++	writel(0, (void __iomem *)(SMI_LARB0 + SMI_LARB_NON_SEC_CON));
++}
++
++static void disp_config_main_path_connection(void)
++{
++	void __iomem *mmsys = (void __iomem *)MMSYS_BASE;
++
++	writel(OVL0_MOUT_EN_OVL0_2L, mmsys + DISP_OVL0_MOUT_EN);
++	writel(OVL0_2L_MOUT_EN_DISP_PATH0, mmsys + DISP_OVL0_2L_MOUT_EN);
++	writel(DISP_PATH0_SEL_IN_OVL0_2L, mmsys + DISP_PATH0_SEL_IN);
++	writel(RDMA0_SOUT_SEL_IN_COLOR, mmsys + DISP_RDMA0_SOUT_SEL_IN);
++	writel(DITHER0_MOUT_EN_DISP_DSI0, mmsys + DISP_DITHER0_MOUT_EN);
++	writel(DSI0_SEL_IN_DITHER0_MOUT, mmsys + DSI0_SEL_IN);
++}
++
++static void disp_config_main_path_mutex(void)
++{
++	void __iomem *mutex = (void __iomem *)DISP_MUTEX_BASE;
++
++	/* mutex[0]: EN at +0x20, CTL at +0x2c, MOD at +0x30. */
++	writel(MUTEX_MOD_MAIN_PATH, mutex + 0x30);
++	writel(MUTEX_SOF_DSI0 | (MUTEX_SOF_DSI0 << 6), mutex + 0x2c);
++	writel(BIT(0), mutex + 0x20);
++}
++
++static void enable_pq(void __iomem *regs, u32 width, u32 height,
++		      int enable_relay)
++{
++	writel(height << 16 | width, regs + DISP_REG_PQ_SIZE);
++	if (enable_relay)
++		writel(PQ_RELAY_MODE, regs + DISP_REG_PQ_CFG);
++	writel(PQ_EN, regs + DISP_REG_PQ_EN);
++}
++
++static void mt8183_disp_pipeline_setup(u32 width, u32 height,
++				       u32 frame_addr)
++{
++	void __iomem *ovl0 = (void __iomem *)DISP_OVL0_BASE;
++	void __iomem *ovl0_2l = (void __iomem *)DISP_OVL0_2L_BASE;
++	void __iomem *rdma0 = (void __iomem *)DISP_RDMA0_BASE;
++	void __iomem *color0 = (void __iomem *)DISP_COLOR0_BASE;
++	u32 pixel_clk = width * height * 60;
++	u32 threshold;
++
++	/*
++	 * ROI of the two overlays of the main path; OVL0 paints its
++	 * background opaque (same background color as the coreboot
++	 * port), OVL0_2L passes the stream through.
++	 */
++	writel(height << 16 | width, ovl0 + DISP_REG_OVL_ROI_SIZE);
++	writel(0xff0000ff, ovl0 + DISP_REG_OVL_ROI_BGCLR);
++	writel(height << 16 | width, ovl0_2l + DISP_REG_OVL_ROI_SIZE);
++	writel(0, ovl0_2l + DISP_REG_OVL_ROI_BGCLR);
++
++	/* RDMA0: fetch size and FIFO thresholds. */
++	writel(width, rdma0 + DISP_REG_RDMA_SIZE_CON_0);
++	writel(height, rdma0 + DISP_REG_RDMA_SIZE_CON_1);
++	/*
++	 * Enable FIFO underflow since DSI can't be blocked. Set the
++	 * output threshold to 6 microseconds with 7/6 overhead to
++	 * account for blanking, and with a pixel depth of 4 bytes
++	 * (from the coreboot rdma_config()).
++	 */
++	threshold = pixel_clk * 4 * 7 / 1000;
++	if (threshold > RDMA_FIFO_SIZE)
++		threshold = RDMA_FIFO_SIZE;
++	writel(RDMA_FIFO_UNDERFLOW_EN |
++	       RDMA_FIFO_PSEUDO_SIZE(RDMA_FIFO_SIZE) |
++	       RDMA_OUTPUT_VALID_FIFO_THRESHOLD(threshold),
++	       rdma0 + DISP_REG_RDMA_FIFO_CON);
++	writel(RDMA_ENGINE_EN, rdma0 + DISP_REG_RDMA_GLOBAL_CON);
++
++	/* COLOR0: bypass all color processing. */
++	writel(width, color0 + DISP_REG_COLOR_WIDTH);
++	writel(height, color0 + DISP_REG_COLOR_HEIGHT);
++	writel(COLOR_BYPASS_ALL | COLOR_SEQ_SEL,
++	       color0 + DISP_REG_COLOR_CFG_MAIN);
++	writel(BIT(0), color0 + DISP_REG_COLOR_START);
++
++	/* Post processing blocks: relay the stream through. */
++	enable_pq((void __iomem *)DISP_CCORR0_BASE, width, height, 1);
++	enable_pq((void __iomem *)DISP_AAL0_BASE, width, height, 0);
++	enable_pq((void __iomem *)DISP_GAMMA0_BASE, width, height, 0);
++	enable_pq((void __iomem *)DISP_DITHER0_BASE, width, height, 1);
++
++	/* Routing of the main path and its trigger (DSI vsync). */
++	disp_config_main_path_connection();
++	disp_config_main_path_mutex();
++
++	/*
++	 * Overlay layer 0: the U-Boot framebuffer, 32-bit XRGB. The
++	 * input format value is the one the coreboot port programs for
++	 * the 32-bit framebuffer surface.
++	 */
++	writel(OVL_INFMT_RGBA8888 << 12, ovl0 + DISP_REG_OVL_L0_CON);
++	writel(height << 16 | width, ovl0 + DISP_REG_OVL_L0_SRC_SIZE);
++	writel((width * 4) & 0xffff, ovl0 + DISP_REG_OVL_L0_PITCH);
++	writel(frame_addr, ovl0 + DISP_REG_OVL_L0_ADDR);
++	writel(BIT(0), ovl0 + DISP_REG_OVL_L0_RDMA_CTRL);
++	writel(RDMA_MEM_GMC, ovl0 + DISP_REG_OVL_L0_RDMA_GMC);
++	writel(BIT(0), ovl0 + DISP_REG_OVL_SRC_CON);
++
++	/* Select the background color of OVL0_2L from its input. */
++	setbits_le32(ovl0_2l + DISP_REG_OVL_DATAPATH_CON, BIT(2));
++
++	/*
++	 * The pass-through overlay must have no layers of its own: the
++	 * boot firmware leaves its layer configuration in place across
++	 * the handoff, and a stale OVL0_2L layer would blend leftover
++	 * DRAM contents on top of the U-Boot framebuffer.
++	 */
++	writel(0, ovl0_2l + DISP_REG_OVL_SRC_CON);
++
++	/* Enable the overlay engines. */
++	writel(1, ovl0 + DISP_REG_OVL_EN);
++	writel(1, ovl0_2l + DISP_REG_OVL_EN);
++}
++
++static int mt8183_display_bringup(struct udevice *dev,
++				  struct video_uc_plat *plat,
++				  struct video_priv *uc_priv,
++				  const char **fail_stage)
++{
++	struct mt8183_display_priv *priv = dev_get_priv(dev);
++	struct mipi_dsi_panel_plat *mplat;
++	struct resource mem_res;
++	phys_addr_t mem_top;
++	ofnode mem;
++	int stage, ret = 0;
++
++	for (stage = STAGE_CLOCKS; stage < STAGE_COUNT && !ret; stage++) {
++		*fail_stage = stage_names[stage];
++
++		switch (stage) {
++		case STAGE_CLOCKS:
++			/*
++			 * Power sequencing note: the display MTCMOS power
++			 * domain (SCPSYS) is enabled by the boot firmware
++			 * and stays on through the handoff; U-Boot has no
++			 * SCPSYS driver for MT8183 to (re-)enable it.
++			 */
++			mt8183_disp_clock_on();
++			break;
++		case STAGE_PANEL:
++			ret = uclass_first_device_err(UCLASS_PANEL,
++						      &priv->panel);
++			if (ret)
++				break;
++			mplat = dev_get_plat(priv->panel);
++
++			/*
++			 * Retrieve the panel data link characteristics and
++			 * publish the DSI device the panel driver sends its
++			 * commands through.
++			 */
++			priv->device.dev = priv->panel;
++			priv->device.lanes = mplat->lanes;
++			priv->device.format = mplat->format;
++			priv->device.mode_flags = mplat->mode_flags;
++			mplat->device = &priv->device;
++			break;
++		case STAGE_DSI_INIT:
++			ret = uclass_get_device(UCLASS_DSI_HOST, 0,
++						&priv->dsi_host);
++			if (ret)
++				break;
++			ret = panel_get_display_timing(priv->panel,
++						       &priv->timing);
++			if (ret)
++				break;
++			ret = dsi_host_init(priv->dsi_host, &priv->device,
++					    &priv->timing, 4, NULL);
++			break;
++		case STAGE_DSI_ENABLE:
++			/*
++			 * Runs the panel power sequence and the
++			 * manufacturer init commands over DSI, in
++			 * command mode.
++			 */
++			ret = panel_enable_backlight(priv->panel);
++			if (ret)
++				break;
++			/* Switch the host to video mode and stream. */
++			ret = dsi_host_enable(priv->dsi_host);
++			break;
++		case STAGE_PIPELINE:
++			/*
++			 * Allocate the framebuffer surface and make sure
++			 * the OS never reuses it: record a /memreserve/
++			 * entry in the control FDT and feed it to LMB,
++			 * like mt8183_disp_setup_handoff() does for the
++			 * firmware scanout buffer. A /memreserve/ entry
++			 * is what protects the region end to end: LMB
++			 * reservations keep U-Boot's page allocator from
++			 * handing it out (and the LMB map update is
++			 * notified into the EFI memory map, so EFI page
++			 * allocations skip it too), the EFI DT fixup
++			 * marks /memreserve/ entries reserved in the
++			 * memory map, and the kernel honors the
++			 * /memreserve/ of whatever DTB it receives. The
++			 * scheme this stage previously used is unsafe on
++			 * the EFI -> grub boot path: it silently ignored
++			 * efi_allocate_pages() failures, and the /memory
++			 * reg trim only protected the control FDT,
++			 * which grub typically does not hand to the
++			 * kernel.
++			 */
++			plat->size = priv->timing.hactive.typ * 4 *
++				     priv->timing.vactive.typ;
++
++			/*
++			 * Allocate the surface at the top of the DRAM
++			 * window the control device tree describes: that
++			 * is the memory the payload kernel will describe
++			 * in turn, so the /memreserve/ entry recorded
++			 * below is guaranteed to cover the surface end to
++			 * end.
++			 */
++			mem = ofnode_path("/memory");
++			if (!ofnode_valid(mem)) {
++				log_err("missing /memory node in the control DTB\n");
++				ret = -EINVAL;
++				break;
++			}
++			ret = ofnode_read_resource(mem, 0, &mem_res);
++			if (ret) {
++				log_err("cannot read the control DTB memory window\n");
++				ret = -EINVAL;
++				break;
++			}
++			mem_top = mem_res.end + 1;
++			ret = lmb_alloc_mem(LMB_MEM_ALLOC_MAX, SZ_2M,
++					    &mem_top, plat->size, LMB_NONE);
++			if (ret) {
++				log_err("framebuffer allocation failed: %d\n",
++					ret);
++				break;
++			}
++			plat->base = mem_top;
++
++			ret = fdt_add_mem_rsv((void *)gd->fdt_blob,
++					      plat->base, plat->size);
++			if (ret) {
++				log_warning("FDT reservation for framebuffer failed: %d\n",
++					    ret);
++				ret = -EIO;
++				break;
++			}
++			boot_fdt_add_mem_rsv_regions(gd->fdt_blob);
++
++			mmu_map_region(plat->base,
++				       ALIGN(plat->size, SZ_4K), false);
++
++			mt8183_disp_pipeline_setup(priv->timing.hactive.typ,
++						   priv->timing.vactive.typ,
++						   plat->base);
++			mt8183_disp_enable_backlight();
++			break;
++		}
++	}
++
++	if (ret)
++		return ret;
++
++	uc_priv->bpix = VIDEO_BPP32;
++	uc_priv->xsize = priv->timing.hactive.typ;
++	uc_priv->ysize = priv->timing.vactive.typ;
++	uc_priv->line_length = uc_priv->xsize * 4;
++	uc_priv->rot = dev_read_u32_default(priv->panel, "rotation", 0) / 90;
++
++	return 0;
++}
++
++static int mt8183_display_probe(struct udevice *dev)
++{
++	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
++	struct video_priv *uc_priv = dev_get_uclass_priv(dev);
++	const char *fail_stage = "start";
++	unsigned long t0, t1;
++	fdt_addr_t ovl;
++	int ret;
++
++	ovl = dev_read_addr(dev);
++	if (ovl == FDT_ADDR_T_NONE)
++		return log_msg_ret("ovl", -EINVAL);
++	t0 = get_timer(0);
++	ret = mt8183_display_bringup(dev, plat, uc_priv, &fail_stage);
++
++	if (!ret) {
++		printf("Video: MT8183 display %dx%d@32bpp at %llx (cold bring-up, %lu ms)\n",
++		       uc_priv->xsize, uc_priv->ysize,
++		       (unsigned long long)plat->base, get_timer(t0));
++
++		/*
++		 * The framebuffer is ordinary cacheable DRAM that the overlay
++		 * reads through DMA: make video_sync() flush the dirty cache
++		 * lines, or freshly drawn console output only becomes visible
++		 * when the cache happens to evict them.
++		 */
++		video_set_flush_dcache(dev, true);
++
++		return 0;
++	}
++
++	printf("Video: MT8183 cold bring-up failed at stage %s (%d), falling back to firmware handoff\n",
++	       fail_stage, ret);
++	t1 = get_timer(0);
++	ret = mt8183_disp_setup_handoff(ovl, plat, uc_priv);
++	if (ret)
++		return ret;
++
++	printf("Video: MT8183 scanout %dx%d@32bpp at %llx (firmware handoff, %lu ms)\n",
++	       uc_priv->xsize, uc_priv->ysize,
++	       (unsigned long long)plat->base, get_timer(t1));
++
++	video_set_flush_dcache(dev, true);
++
++	return 0;
++}
++
++static const struct udevice_id mt8183_display_ids[] = {
++	{ .compatible = "mediatek,mt8183-disp-ovl" },
++	{ }
++};
++
++U_BOOT_DRIVER(mt8183_display) = {
++	.name		= "mt8183_display",
++	.id		= UCLASS_VIDEO,
++	.of_match	= mt8183_display_ids,
++	.probe		= mt8183_display_probe,
++	.priv_auto	= sizeof(struct mt8183_display_priv),
++
++};
+diff --git a/drivers/video/panel_boe_tv101wum.c b/drivers/video/panel_boe_tv101wum.c
+new file mode 100644
+index 00000000000..7edcb6cff54
+--- /dev/null
++++ b/drivers/video/panel_boe_tv101wum.c
+@@ -0,0 +1,515 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * BOE TV101WUM-NL6 MIPI DSI panel driver.
++ *
++ * Copyright (C) 2026 Vincent Haudiquet <vhaudiquet@gmail.com>
++ *
++ * 1200x1920 (native portrait) video-mode panel, 4 data lanes, RGB888,
++ * mounted rotated in the krane (Lenovo IdeaPad Duet) chassis.
++ *
++ * The power sequence and the manufacturer initialization commands are
++ * ported from the ChromeOS coreboot port for this exact panel,
++ * src/mainboard/google/kukui/panel_params/panel-BOE_TV101WUM_NL6.c in
++ * coreboot 4.14, which matches the sequence of the Linux kernel driver
++ * drivers/gpu/drm/panel/panel-boe-tv101wum-nl6.c for the
++ * "boe,tv101wum-nl6" entry (159.425 MHz pixel clock, 100/40/24
++ * horizontal and 10/14/4 vertical timing).
++ */
++
++#include <backlight.h>
++#include <dm.h>
++#include <mipi_dsi.h>
++#include <panel.h>
++#include <asm/gpio.h>
++#include <dm/device_compat.h>
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include <power/regulator.h>
++
++/*
++ * Manufacturer initialization sequence, one command per line in the
++ * shape of the Linux panel-boe-tv101wum-nl6.c init function. Ported
++ * verbatim from the coreboot panel-BOE_TV101WUM_NL6.c table.
++ */
++#define dsi_generic_write_seq(dsi, cmd, seq...) do {			\
++		static const u8 b[] = { cmd, seq };			\
++		int ret;						\
++									\
++		ret = mipi_dsi_dcs_write_buffer(dsi, b, ARRAY_SIZE(b));	\
++		if (ret < 0)						\
++			return ret;					\
++	} while (0)
++
++static int boe_panel_send_init_sequence(struct udevice *dev)
++{
++	struct mipi_dsi_panel_plat *plat = dev_get_plat(dev);
++	struct mipi_dsi_device *dsi = plat->device;
++
++	mdelay(24);
++	dsi_generic_write_seq(dsi, 0xB0, 0x05);
++	dsi_generic_write_seq(dsi, 0xB1, 0xE5);
++	dsi_generic_write_seq(dsi, 0xB3, 0x52);
++	dsi_generic_write_seq(dsi, 0xB0, 0x00);
++	dsi_generic_write_seq(dsi, 0xB3, 0x88);
++	dsi_generic_write_seq(dsi, 0xB0, 0x04);
++	dsi_generic_write_seq(dsi, 0xB8, 0x00);
++	dsi_generic_write_seq(dsi, 0xB0, 0x00);
++	dsi_generic_write_seq(dsi, 0xB6, 0x03);
++	dsi_generic_write_seq(dsi, 0xBA, 0x8B);
++	dsi_generic_write_seq(dsi, 0xBF, 0x1A);
++	dsi_generic_write_seq(dsi, 0xC0, 0x0F);
++	dsi_generic_write_seq(dsi, 0xC2, 0x0C);
++	dsi_generic_write_seq(dsi, 0xC3, 0x02);
++	dsi_generic_write_seq(dsi, 0xC4, 0x0C);
++	dsi_generic_write_seq(dsi, 0xC5, 0x02);
++	dsi_generic_write_seq(dsi, 0xB0, 0x01);
++	dsi_generic_write_seq(dsi, 0xE0, 0x26);
++	dsi_generic_write_seq(dsi, 0xE1, 0x26);
++	dsi_generic_write_seq(dsi, 0xDC, 0x00);
++	dsi_generic_write_seq(dsi, 0xDD, 0x00);
++	dsi_generic_write_seq(dsi, 0xCC, 0x26);
++	dsi_generic_write_seq(dsi, 0xCD, 0x26);
++	dsi_generic_write_seq(dsi, 0xC8, 0x00);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xD2, 0x03);
++	dsi_generic_write_seq(dsi, 0xD3, 0x03);
++	dsi_generic_write_seq(dsi, 0xE6, 0x04);
++	dsi_generic_write_seq(dsi, 0xE7, 0x04);
++	dsi_generic_write_seq(dsi, 0xC4, 0x09);
++	dsi_generic_write_seq(dsi, 0xC5, 0x09);
++	dsi_generic_write_seq(dsi, 0xD8, 0x0A);
++	dsi_generic_write_seq(dsi, 0xD9, 0x0A);
++	dsi_generic_write_seq(dsi, 0xC2, 0x0B);
++	dsi_generic_write_seq(dsi, 0xC3, 0x0B);
++	dsi_generic_write_seq(dsi, 0xD6, 0x0C);
++	dsi_generic_write_seq(dsi, 0xD7, 0x0C);
++	dsi_generic_write_seq(dsi, 0xC0, 0x05);
++	dsi_generic_write_seq(dsi, 0xC1, 0x05);
++	dsi_generic_write_seq(dsi, 0xD4, 0x06);
++	dsi_generic_write_seq(dsi, 0xD5, 0x06);
++	dsi_generic_write_seq(dsi, 0xCA, 0x07);
++	dsi_generic_write_seq(dsi, 0xCB, 0x07);
++	dsi_generic_write_seq(dsi, 0xDE, 0x08);
++	dsi_generic_write_seq(dsi, 0xDF, 0x08);
++	dsi_generic_write_seq(dsi, 0xB0, 0x02);
++	dsi_generic_write_seq(dsi, 0xC0, 0x00);
++	dsi_generic_write_seq(dsi, 0xC1, 0x0D);
++	dsi_generic_write_seq(dsi, 0xC2, 0x17);
++	dsi_generic_write_seq(dsi, 0xC3, 0x26);
++	dsi_generic_write_seq(dsi, 0xC4, 0x31);
++	dsi_generic_write_seq(dsi, 0xC5, 0x1C);
++	dsi_generic_write_seq(dsi, 0xC6, 0x2C);
++	dsi_generic_write_seq(dsi, 0xC7, 0x33);
++	dsi_generic_write_seq(dsi, 0xC8, 0x31);
++	dsi_generic_write_seq(dsi, 0xC9, 0x37);
++	dsi_generic_write_seq(dsi, 0xCA, 0x37);
++	dsi_generic_write_seq(dsi, 0xCB, 0x37);
++	dsi_generic_write_seq(dsi, 0xCC, 0x39);
++	dsi_generic_write_seq(dsi, 0xCD, 0x2E);
++	dsi_generic_write_seq(dsi, 0xCE, 0x2F);
++	dsi_generic_write_seq(dsi, 0xCF, 0x2F);
++	dsi_generic_write_seq(dsi, 0xD0, 0x07);
++	dsi_generic_write_seq(dsi, 0xD2, 0x00);
++	dsi_generic_write_seq(dsi, 0xD3, 0x0D);
++	dsi_generic_write_seq(dsi, 0xD4, 0x17);
++	dsi_generic_write_seq(dsi, 0xD5, 0x26);
++	dsi_generic_write_seq(dsi, 0xD6, 0x31);
++	dsi_generic_write_seq(dsi, 0xD7, 0x3F);
++	dsi_generic_write_seq(dsi, 0xD8, 0x3F);
++	dsi_generic_write_seq(dsi, 0xD9, 0x3F);
++	dsi_generic_write_seq(dsi, 0xDA, 0x3F);
++	dsi_generic_write_seq(dsi, 0xDB, 0x37);
++	dsi_generic_write_seq(dsi, 0xDC, 0x37);
++	dsi_generic_write_seq(dsi, 0xDD, 0x37);
++	dsi_generic_write_seq(dsi, 0xDE, 0x39);
++	dsi_generic_write_seq(dsi, 0xDF, 0x2E);
++	dsi_generic_write_seq(dsi, 0xE0, 0x2F);
++	dsi_generic_write_seq(dsi, 0xE1, 0x2F);
++	dsi_generic_write_seq(dsi, 0xE2, 0x07);
++	dsi_generic_write_seq(dsi, 0xB0, 0x03);
++	dsi_generic_write_seq(dsi, 0xC8, 0x0B);
++	dsi_generic_write_seq(dsi, 0xC9, 0x07);
++	dsi_generic_write_seq(dsi, 0xC3, 0x00);
++	dsi_generic_write_seq(dsi, 0xE7, 0x00);
++	dsi_generic_write_seq(dsi, 0xC5, 0x2A);
++	dsi_generic_write_seq(dsi, 0xDE, 0x2A);
++	dsi_generic_write_seq(dsi, 0xCA, 0x43);
++	dsi_generic_write_seq(dsi, 0xC9, 0x07);
++	dsi_generic_write_seq(dsi, 0xE4, 0xC0);
++	dsi_generic_write_seq(dsi, 0xE5, 0x0D);
++	dsi_generic_write_seq(dsi, 0xCB, 0x00);
++	dsi_generic_write_seq(dsi, 0xB0, 0x06);
++	dsi_generic_write_seq(dsi, 0xB8, 0xA5);
++	dsi_generic_write_seq(dsi, 0xC0, 0xA5);
++	dsi_generic_write_seq(dsi, 0xC7, 0x0F);
++	dsi_generic_write_seq(dsi, 0xD5, 0x32);
++	dsi_generic_write_seq(dsi, 0xB8, 0x00);
++	dsi_generic_write_seq(dsi, 0xC0, 0x00);
++	dsi_generic_write_seq(dsi, 0xBC, 0x00);
++	dsi_generic_write_seq(dsi, 0xB0, 0x07);
++	dsi_generic_write_seq(dsi, 0xB1, 0x00);
++	dsi_generic_write_seq(dsi, 0xB2, 0x02);
++	dsi_generic_write_seq(dsi, 0xB3, 0x0F);
++	dsi_generic_write_seq(dsi, 0xB4, 0x25);
++	dsi_generic_write_seq(dsi, 0xB5, 0x39);
++	dsi_generic_write_seq(dsi, 0xB6, 0x4E);
++	dsi_generic_write_seq(dsi, 0xB7, 0x72);
++	dsi_generic_write_seq(dsi, 0xB8, 0x97);
++	dsi_generic_write_seq(dsi, 0xB9, 0xDC);
++	dsi_generic_write_seq(dsi, 0xBA, 0x22);
++	dsi_generic_write_seq(dsi, 0xBB, 0xA4);
++	dsi_generic_write_seq(dsi, 0xBC, 0x2B);
++	dsi_generic_write_seq(dsi, 0xBD, 0x2F);
++	dsi_generic_write_seq(dsi, 0xBE, 0xA9);
++	dsi_generic_write_seq(dsi, 0xBF, 0x25);
++	dsi_generic_write_seq(dsi, 0xC0, 0x61);
++	dsi_generic_write_seq(dsi, 0xC1, 0x97);
++	dsi_generic_write_seq(dsi, 0xC2, 0xB2);
++	dsi_generic_write_seq(dsi, 0xC3, 0xCD);
++	dsi_generic_write_seq(dsi, 0xC4, 0xD9);
++	dsi_generic_write_seq(dsi, 0xC5, 0xE7);
++	dsi_generic_write_seq(dsi, 0xC6, 0xF4);
++	dsi_generic_write_seq(dsi, 0xC7, 0xFA);
++	dsi_generic_write_seq(dsi, 0xC8, 0xFC);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xCA, 0x00);
++	dsi_generic_write_seq(dsi, 0xCB, 0x16);
++	dsi_generic_write_seq(dsi, 0xCC, 0xAF);
++	dsi_generic_write_seq(dsi, 0xCD, 0xFF);
++	dsi_generic_write_seq(dsi, 0xCE, 0xFF);
++	dsi_generic_write_seq(dsi, 0xB0, 0x08);
++	dsi_generic_write_seq(dsi, 0xB1, 0x04);
++	dsi_generic_write_seq(dsi, 0xB2, 0x05);
++	dsi_generic_write_seq(dsi, 0xB3, 0x11);
++	dsi_generic_write_seq(dsi, 0xB4, 0x24);
++	dsi_generic_write_seq(dsi, 0xB5, 0x39);
++	dsi_generic_write_seq(dsi, 0xB6, 0x4F);
++	dsi_generic_write_seq(dsi, 0xB7, 0x72);
++	dsi_generic_write_seq(dsi, 0xB8, 0x98);
++	dsi_generic_write_seq(dsi, 0xB9, 0xDC);
++	dsi_generic_write_seq(dsi, 0xBA, 0x23);
++	dsi_generic_write_seq(dsi, 0xBB, 0xA6);
++	dsi_generic_write_seq(dsi, 0xBC, 0x2C);
++	dsi_generic_write_seq(dsi, 0xBD, 0x30);
++	dsi_generic_write_seq(dsi, 0xBE, 0xAA);
++	dsi_generic_write_seq(dsi, 0xBF, 0x26);
++	dsi_generic_write_seq(dsi, 0xC0, 0x62);
++	dsi_generic_write_seq(dsi, 0xC1, 0x9B);
++	dsi_generic_write_seq(dsi, 0xC2, 0xB5);
++	dsi_generic_write_seq(dsi, 0xC3, 0xCF);
++	dsi_generic_write_seq(dsi, 0xC4, 0xDB);
++	dsi_generic_write_seq(dsi, 0xC5, 0xE8);
++	dsi_generic_write_seq(dsi, 0xC6, 0xF5);
++	dsi_generic_write_seq(dsi, 0xC7, 0xFA);
++	dsi_generic_write_seq(dsi, 0xC8, 0xFC);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xCA, 0x00);
++	dsi_generic_write_seq(dsi, 0xCB, 0x16);
++	dsi_generic_write_seq(dsi, 0xCC, 0xAF);
++	dsi_generic_write_seq(dsi, 0xCD, 0xFF);
++	dsi_generic_write_seq(dsi, 0xCE, 0xFF);
++	dsi_generic_write_seq(dsi, 0xB0, 0x09);
++	dsi_generic_write_seq(dsi, 0xB1, 0x04);
++	dsi_generic_write_seq(dsi, 0xB2, 0x02);
++	dsi_generic_write_seq(dsi, 0xB3, 0x16);
++	dsi_generic_write_seq(dsi, 0xB4, 0x24);
++	dsi_generic_write_seq(dsi, 0xB5, 0x3B);
++	dsi_generic_write_seq(dsi, 0xB6, 0x4F);
++	dsi_generic_write_seq(dsi, 0xB7, 0x73);
++	dsi_generic_write_seq(dsi, 0xB8, 0x99);
++	dsi_generic_write_seq(dsi, 0xB9, 0xE0);
++	dsi_generic_write_seq(dsi, 0xBA, 0x26);
++	dsi_generic_write_seq(dsi, 0xBB, 0xAD);
++	dsi_generic_write_seq(dsi, 0xBC, 0x36);
++	dsi_generic_write_seq(dsi, 0xBD, 0x3A);
++	dsi_generic_write_seq(dsi, 0xBE, 0xAE);
++	dsi_generic_write_seq(dsi, 0xBF, 0x2A);
++	dsi_generic_write_seq(dsi, 0xC0, 0x66);
++	dsi_generic_write_seq(dsi, 0xC1, 0x9E);
++	dsi_generic_write_seq(dsi, 0xC2, 0xB8);
++	dsi_generic_write_seq(dsi, 0xC3, 0xD1);
++	dsi_generic_write_seq(dsi, 0xC4, 0xDD);
++	dsi_generic_write_seq(dsi, 0xC5, 0xE9);
++	dsi_generic_write_seq(dsi, 0xC6, 0xF6);
++	dsi_generic_write_seq(dsi, 0xC7, 0xFA);
++	dsi_generic_write_seq(dsi, 0xC8, 0xFC);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xCA, 0x00);
++	dsi_generic_write_seq(dsi, 0xCB, 0x16);
++	dsi_generic_write_seq(dsi, 0xCC, 0xAF);
++	dsi_generic_write_seq(dsi, 0xCD, 0xFF);
++	dsi_generic_write_seq(dsi, 0xCE, 0xFF);
++	dsi_generic_write_seq(dsi, 0xB0, 0x0A);
++	dsi_generic_write_seq(dsi, 0xB1, 0x00);
++	dsi_generic_write_seq(dsi, 0xB2, 0x02);
++	dsi_generic_write_seq(dsi, 0xB3, 0x0F);
++	dsi_generic_write_seq(dsi, 0xB4, 0x25);
++	dsi_generic_write_seq(dsi, 0xB5, 0x39);
++	dsi_generic_write_seq(dsi, 0xB6, 0x4E);
++	dsi_generic_write_seq(dsi, 0xB7, 0x72);
++	dsi_generic_write_seq(dsi, 0xB8, 0x97);
++	dsi_generic_write_seq(dsi, 0xB9, 0xDC);
++	dsi_generic_write_seq(dsi, 0xBA, 0x22);
++	dsi_generic_write_seq(dsi, 0xBB, 0xA4);
++	dsi_generic_write_seq(dsi, 0xBC, 0x2B);
++	dsi_generic_write_seq(dsi, 0xBD, 0x2F);
++	dsi_generic_write_seq(dsi, 0xBE, 0xA9);
++	dsi_generic_write_seq(dsi, 0xBF, 0x25);
++	dsi_generic_write_seq(dsi, 0xC0, 0x61);
++	dsi_generic_write_seq(dsi, 0xC1, 0x97);
++	dsi_generic_write_seq(dsi, 0xC2, 0xB2);
++	dsi_generic_write_seq(dsi, 0xC3, 0xCD);
++	dsi_generic_write_seq(dsi, 0xC4, 0xD9);
++	dsi_generic_write_seq(dsi, 0xC5, 0xE7);
++	dsi_generic_write_seq(dsi, 0xC6, 0xF4);
++	dsi_generic_write_seq(dsi, 0xC7, 0xFA);
++	dsi_generic_write_seq(dsi, 0xC8, 0xFC);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xCA, 0x00);
++	dsi_generic_write_seq(dsi, 0xCB, 0x16);
++	dsi_generic_write_seq(dsi, 0xCC, 0xAF);
++	dsi_generic_write_seq(dsi, 0xCD, 0xFF);
++	dsi_generic_write_seq(dsi, 0xCE, 0xFF);
++	dsi_generic_write_seq(dsi, 0xB0, 0x0B);
++	dsi_generic_write_seq(dsi, 0xB1, 0x04);
++	dsi_generic_write_seq(dsi, 0xB2, 0x05);
++	dsi_generic_write_seq(dsi, 0xB3, 0x11);
++	dsi_generic_write_seq(dsi, 0xB4, 0x24);
++	dsi_generic_write_seq(dsi, 0xB5, 0x39);
++	dsi_generic_write_seq(dsi, 0xB6, 0x4F);
++	dsi_generic_write_seq(dsi, 0xB7, 0x72);
++	dsi_generic_write_seq(dsi, 0xB8, 0x98);
++	dsi_generic_write_seq(dsi, 0xB9, 0xDC);
++	dsi_generic_write_seq(dsi, 0xBA, 0x23);
++	dsi_generic_write_seq(dsi, 0xBB, 0xA6);
++	dsi_generic_write_seq(dsi, 0xBC, 0x2C);
++	dsi_generic_write_seq(dsi, 0xBD, 0x30);
++	dsi_generic_write_seq(dsi, 0xBE, 0xAA);
++	dsi_generic_write_seq(dsi, 0xBF, 0x26);
++	dsi_generic_write_seq(dsi, 0xC0, 0x62);
++	dsi_generic_write_seq(dsi, 0xC1, 0x9B);
++	dsi_generic_write_seq(dsi, 0xC2, 0xB5);
++	dsi_generic_write_seq(dsi, 0xC3, 0xCF);
++	dsi_generic_write_seq(dsi, 0xC4, 0xDB);
++	dsi_generic_write_seq(dsi, 0xC5, 0xE8);
++	dsi_generic_write_seq(dsi, 0xC6, 0xF5);
++	dsi_generic_write_seq(dsi, 0xC7, 0xFA);
++	dsi_generic_write_seq(dsi, 0xC8, 0xFC);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xCA, 0x00);
++	dsi_generic_write_seq(dsi, 0xCB, 0x16);
++	dsi_generic_write_seq(dsi, 0xCC, 0xAF);
++	dsi_generic_write_seq(dsi, 0xCD, 0xFF);
++	dsi_generic_write_seq(dsi, 0xCE, 0xFF);
++	dsi_generic_write_seq(dsi, 0xB0, 0x0C);
++	dsi_generic_write_seq(dsi, 0xB1, 0x04);
++	dsi_generic_write_seq(dsi, 0xB2, 0x02);
++	dsi_generic_write_seq(dsi, 0xB3, 0x16);
++	dsi_generic_write_seq(dsi, 0xB4, 0x24);
++	dsi_generic_write_seq(dsi, 0xB5, 0x3B);
++	dsi_generic_write_seq(dsi, 0xB6, 0x4F);
++	dsi_generic_write_seq(dsi, 0xB7, 0x73);
++	dsi_generic_write_seq(dsi, 0xB8, 0x99);
++	dsi_generic_write_seq(dsi, 0xB9, 0xE0);
++	dsi_generic_write_seq(dsi, 0xBA, 0x26);
++	dsi_generic_write_seq(dsi, 0xBB, 0xAD);
++	dsi_generic_write_seq(dsi, 0xBC, 0x36);
++	dsi_generic_write_seq(dsi, 0xBD, 0x3A);
++	dsi_generic_write_seq(dsi, 0xBE, 0xAE);
++	dsi_generic_write_seq(dsi, 0xBF, 0x2A);
++	dsi_generic_write_seq(dsi, 0xC0, 0x66);
++	dsi_generic_write_seq(dsi, 0xC1, 0x9E);
++	dsi_generic_write_seq(dsi, 0xC2, 0xB8);
++	dsi_generic_write_seq(dsi, 0xC3, 0xD1);
++	dsi_generic_write_seq(dsi, 0xC4, 0xDD);
++	dsi_generic_write_seq(dsi, 0xC5, 0xE9);
++	dsi_generic_write_seq(dsi, 0xC6, 0xF6);
++	dsi_generic_write_seq(dsi, 0xC7, 0xFA);
++	dsi_generic_write_seq(dsi, 0xC8, 0xFC);
++	dsi_generic_write_seq(dsi, 0xC9, 0x00);
++	dsi_generic_write_seq(dsi, 0xCA, 0x00);
++	dsi_generic_write_seq(dsi, 0xCB, 0x16);
++	dsi_generic_write_seq(dsi, 0xCC, 0xAF);
++	dsi_generic_write_seq(dsi, 0xCD, 0xFF);
++	dsi_generic_write_seq(dsi, 0xCE, 0xFF);
++	dsi_generic_write_seq(dsi, 0xB0, 0x00);
++	dsi_generic_write_seq(dsi, 0xB3, 0x08);
++	dsi_generic_write_seq(dsi, 0xB0, 0x04);
++	dsi_generic_write_seq(dsi, 0xB8, 0x68);
++	mdelay(150);
++
++	return 0;
++}
++
++/*
++ * Display timing. Totals match the Linux driver's
++ * boe_tv101wum_nl6_default_mode (htotal 1364, vtotal 1948), but the
++ * sync/back-porch split follows the coreboot EDID for this panel
++ * (hso 100 / hspw 24 / hbl-hso-hspw 40; vso 10 / vspw 4 / 14), the
++ * configuration proven to drive this panel on this device.
++ */
++static const struct display_timing boe_tv101wum_nl6_timing = {
++	.pixelclock.typ		= 159425000,
++	.hactive.typ		= 1200,
++	.hfront_porch.typ	= 100,
++	.hback_porch.typ	= 40,
++	.hsync_len.typ		= 24,
++	.vactive.typ		= 1920,
++	.vfront_porch.typ	= 10,
++	.vback_porch.typ	= 14,
++	.vsync_len.typ		= 4,
++};
++
++struct boe_panel_priv {
++	struct udevice *avdd;
++	struct udevice *avee;
++	struct udevice *pp1800;
++	struct gpio_desc enable;
++};
++
++static int boe_panel_enable_backlight(struct udevice *dev)
++{
++	struct boe_panel_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	/*
++	 * Power sequence from boe_panel_prepare() of the Linux driver
++	 * (regulators on, reset pulse, manufacturer init commands). On
++	 * the kukui family the supplies are already enabled by the boot
++	 * firmware; enabling them again is a no-op.
++	 */
++	if (CONFIG_IS_ENABLED(DM_REGULATOR)) {
++		if (priv->avdd) {
++			ret = regulator_set_enable_if_allowed(priv->avdd,
++							      true);
++			if (ret && ret != -ENOSYS)
++				return ret;
++		}
++		if (priv->avee) {
++			ret = regulator_set_enable_if_allowed(priv->avee,
++							      true);
++			if (ret && ret != -ENOSYS)
++				return ret;
++		}
++		if (priv->pp1800) {
++			ret = regulator_set_enable_if_allowed(priv->pp1800,
++							      true);
++			if (ret && ret != -ENOSYS)
++				return ret;
++		}
++	}
++	mdelay(10);
++
++	/*
++	 * Reset pulse, following boe_panel_prepare() of the Linux driver.
++	 * The panel reset line is active-low and wired to the
++	 * "enable-gpios" pin, which the device tree describes as a plain
++	 * active-high GPIO: logical 1 therefore means reset released, and
++	 * the sequence ends with the reset released before the init
++	 * commands.
++	 */
++	if (dm_gpio_is_valid(&priv->enable)) {
++		dm_gpio_set_value(&priv->enable, 1);
++		udelay(1500);
++		dm_gpio_set_value(&priv->enable, 0);
++		udelay(1500);
++		dm_gpio_set_value(&priv->enable, 1);
++	}
++	udelay(8000);
++
++	ret = boe_panel_send_init_sequence(dev);
++	if (ret) {
++		dev_err(dev, "failed to send init sequence: %d\n", ret);
++		return ret;
++	}
++
++	/* Enable the backlight after the 150 ms delay of the sequence. */
++	if (CONFIG_IS_ENABLED(BACKLIGHT)) {
++		struct udevice *backlight;
++
++		if (!uclass_get_device_by_phandle(UCLASS_PANEL_BACKLIGHT, dev,
++						  "backlight", &backlight))
++			backlight_enable(backlight);
++	}
++
++	return 0;
++}
++
++static int boe_panel_get_display_timing(struct udevice *dev,
++					struct display_timing *timings)
++{
++	memcpy(timings, &boe_tv101wum_nl6_timing, sizeof(*timings));
++
++	return 0;
++}
++
++static int boe_panel_of_to_plat(struct udevice *dev)
++{
++	struct boe_panel_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	if (CONFIG_IS_ENABLED(DM_REGULATOR)) {
++		ret = device_get_supply_regulator(dev, "avdd-supply",
++						  &priv->avdd);
++		if (ret && ret != -ENOENT)
++			return ret;
++		ret = device_get_supply_regulator(dev, "avee-supply",
++						  &priv->avee);
++		if (ret && ret != -ENOENT)
++			return ret;
++		ret = device_get_supply_regulator(dev, "pp1800-supply",
++						  &priv->pp1800);
++		if (ret && ret != -ENOENT)
++			return ret;
++	}
++
++	ret = gpio_request_by_name(dev, "enable-gpios", 0, &priv->enable,
++				   GPIOD_IS_OUT);
++	if (ret && ret != -ENOENT) {
++		dev_err(dev, "cannot get enable GPIO: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Default to the reset released: a failed bring-up falls back to
++	 * the firmware-handoff revival, which needs the panel alive.
++	 */
++	if (dm_gpio_is_valid(&priv->enable))
++		dm_gpio_set_value(&priv->enable, 1);
++
++	return 0;
++}
++
++static int boe_panel_probe(struct udevice *dev)
++{
++	struct mipi_dsi_panel_plat *plat = dev_get_plat(dev);
++
++	/* Fill the DSI data link characteristics for the host. */
++	plat->lanes = 4;
++	plat->format = MIPI_DSI_FMT_RGB888;
++	plat->mode_flags = MIPI_DSI_MODE_VIDEO |
++			   MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
++			   MIPI_DSI_MODE_LPM;
++
++	return 0;
++}
++
++static const struct panel_ops boe_panel_ops = {
++	.enable_backlight = boe_panel_enable_backlight,
++	.get_display_timing = boe_panel_get_display_timing,
++};
++
++static const struct udevice_id boe_panel_ids[] = {
++	{ .compatible = "boe,tv101wum-nl6" },
++};
++
++U_BOOT_DRIVER(boe_panel) = {
++	.name		= "boe_panel",
++	.id		= UCLASS_PANEL,
++	.of_match	= boe_panel_ids,
++	.ops		= &boe_panel_ops,
++	.of_to_plat	= boe_panel_of_to_plat,
++	.probe		= boe_panel_probe,
++	.plat_auto	= sizeof(struct mipi_dsi_panel_plat),
++	.priv_auto	= sizeof(struct boe_panel_priv),
++};
+-- 
+2.53.0
+

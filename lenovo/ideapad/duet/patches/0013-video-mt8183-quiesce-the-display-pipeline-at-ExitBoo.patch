@@ -1,0 +1,270 @@
+From 746fd30af6a5dd7a49bb2b207dab09133365e2aa Mon Sep 17 00:00:00 2001
+From: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+Date: Fri, 11 Sep 2026 23:19:11 +0200
+Subject: [PATCH 13/21] video: mt8183: quiesce the display pipeline at
+ ExitBootServices
+
+The framebuffer the overlay scans out of lives behind the IOMMU: U-Boot
+takes the SMI local arbiter out of the M4U domain for its own scanout
+(mt8183_disp_clock_on()), and Linux re-enables M4U translation when its
+IOMMU driver probes.  A pipeline that is still running at that point
+keeps fetching the framebuffer through the now-translating IOMMU, the
+region has no IOMMU mapping, and every frame faults: the resulting
+interrupt storm starves timer handling and RCU on the big cores and the
+machine wedges shortly after the handoff.
+
+Implement board_quiesce_devices() for the pipeline, mirroring the Linux
+disable order:
+
+- stop the DRAM fetchers (OVL0, OVL0_2L, RDMA0) first with bounded
+  idle waits -- a display engine stalled with an outstanding AXI read
+  holds that request in the SMI/CCI fabric, and the kernel's first
+  display domain or clock transition then reconfigures bus protection
+  across a wedged interconnect and every CPU dies silently at whatever
+  code touches the fabric next (crash sites: sysfb_init, armv8 PMU
+  probe IPI, udev module icache flush);
+- drain the DSI engine (stop, poll DSI_INTSTA.BUSY, reset-and-retry,
+  then switch out of video mode) before powering the D-PHY off;
+- mask the DSI interrupt sources and clear the status flags: the Linux
+  driver enables the same sources on its first DSI enable, and a
+  level-triggered status inherited from the boot flow would fire the
+  DSI IRQ the moment it does, with an engine state that may never
+  clear DSI_BUSY;
+- stop the color path and mutex, turn the backlight off, and gate the
+  MMSYS display clock domains last.
+
+Linux performs a full cold bring-up of the pipeline and the panel, so
+the handoff state does not need to be preserved.
+
+The quiesce hook also carries the SoC-agnostic part of the handoff
+hygiene: stop the hardware watchdog (CONFIG_WATCHDOG_AUTOSTART=y arms
+it at initr_watchdog() and nothing in the EFI path stops it -- the EFI
+watchdog timer only stops the EFI timer event), and end
+ExitBootServices with the CPU in the state the classic Linux boot
+protocol expects (interrupts off, caches cleaned and disabled, MMU off,
+TLB invalidated): efi_exit_caches() compiles out on arm64 (the GRUB
+workaround is ARM32-only), so the EFI boot path otherwise hands the
+kernel a CPU with U-Boot's page tables still active and dirty D-cache
+lines over the payload regions.  grub continues executing physically
+after ExitBootServices, exactly like the arm32 GRUB workaround has
+done for years.
+
+Finally, make the MT8183 display-driver choice optional so a board can
+run with no MT8183 display driver at all (serial console only, the
+pipeline left as the boot firmware set it): provide the SoC-agnostic
+part of board_quiesce_devices() in the SoC init when the cold bring-up
+driver is not selected, since without it an EFI build with the choice
+unset does not link.
+
+Signed-off-by: Valentin Haudiquet <valentin.haudiquet@canonical.com>
+---
+ arch/arm/mach-mediatek/mt8183/init.c |  24 +++++-
+ drivers/video/Kconfig                |   1 +
+ drivers/video/mt8183_display.c       | 112 +++++++++++++++++++++++++++
+ 3 files changed, 136 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/mach-mediatek/mt8183/init.c b/arch/arm/mach-mediatek/mt8183/init.c
+index 8797261368e..6cb7c742ee4 100644
+--- a/arch/arm/mach-mediatek/mt8183/init.c
++++ b/arch/arm/mach-mediatek/mt8183/init.c
+@@ -4,15 +4,16 @@
+  * Copyright (C) 2021 BayLibre, SAS
+  * Author: Fabien Parent <fparent@baylibre.com>
+  */
+-
+ #include <clk.h>
+ #include <dm.h>
+ #include <fdtdec.h>
+ #include <ram.h>
++#include <wdt.h>
+ #include <asm/arch/misc.h>
+ #include <asm/armv8/mmu.h>
+ #include <asm/sections.h>
+ #include <asm/system.h>
++#include <asm/u-boot.h>
+ #include <dm/uclass.h>
+ #include <dt-bindings/clock/mt8516-clk.h>
+ 
+@@ -28,6 +29,27 @@ void reset_cpu(void)
+ 	psci_system_reset();
+ }
+ 
++#if !IS_ENABLED(CONFIG_VIDEO_MT8183_DISPLAY)
++/*
++ * ExitBootServices handoff hook, used when the MT8183 display drivers
++ * are disabled (no display pipeline to quiesce): the SoC-agnostic part
++ * of the handoff hygiene still applies. Keep the hardware watchdog
++ * from running into the kernel (CONFIG_WATCHDOG_AUTOSTART arms it and
++ * nothing in the EFI path stops it otherwise), and leave the CPU in
++ * the state the classic Linux boot protocol expects: interrupts off,
++ * caches cleaned and disabled, MMU off, TLB invalidated (the arm64 EFI
++ * path otherwise hands the kernel a CPU with U-Boot's page tables
++ * still active and dirty D-cache lines over payload regions).
++ */
++void board_quiesce_devices(void)
++{
++	if (CONFIG_IS_ENABLED(WDT))
++		wdt_stop_all();
++
++	cleanup_before_linux();
++}
++#endif
++
+ int print_cpuinfo(void)
+ {
+ 	printf("CPU:   MediaTek MT8183\n");
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index 3cd3d69449e..78d7fee3801 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -1025,6 +1025,7 @@ config VIDEO_MCDE_SIMPLE
+ choice
+ 	prompt "MT8183 display driver"
+ 	depends on ARCH_MEDIATEK
++	optional
+ 	help
+ 	  Selects the driver that drives the display pipeline on MT8183
+ 	  boards. Leave unset to run without any MT8183 display driver
+diff --git a/drivers/video/mt8183_display.c b/drivers/video/mt8183_display.c
+index 8b0d100263c..1fe0885dc43 100644
+--- a/drivers/video/mt8183_display.c
++++ b/drivers/video/mt8183_display.c
+@@ -31,12 +31,14 @@
+  * firmware instead, and reports which path was taken.
+  */
+ 
++#include <linux/iopoll.h>
+ #include <dm.h>
+ #include <dsi_host.h>
+ #include <image.h>
+ #include <lmb.h>
+ #include <panel.h>
+ #include <video.h>
++#include <wdt.h>
+ #include <asm/io.h>
+ #include <time.h>
+ #include <asm/system.h>
+@@ -67,6 +69,9 @@
+ #define DISP_DITHER0_BASE	0x14012000
+ #define DISP_DSI0_BASE		0x14014000
+ #define DISP_MUTEX_BASE		0x14016000
++
++/* DSI_INTSTA (0x0c) write-1-to-clear status flags (mtk_dsi.c bit layout) */
++#define DSI_INT_STA_FLAGS	(BIT(0) | BIT(1) | BIT(3))
+ #define SMI_LARB0		0x14017000
+ 
+ /*
+@@ -540,3 +545,110 @@ U_BOOT_DRIVER(mt8183_display) = {
+ 	.priv_auto	= sizeof(struct mt8183_display_priv),
+ 
+ };
++
++/*
++ * Stop the display pipeline before the OS takes over.
++ *
++ * The framebuffer the overlay scans out of lives behind the IOMMU: U-Boot
++ * takes the SMI local arbiter out of the M4U domain for its own scanout
++ * (see mt8183_disp_clock_on()), and the kernel re-enables M4U translation
++ * when its IOMMU driver probes. A pipeline that is still running at that
++ * point keeps fetching the framebuffer through the now-translating IOMMU,
++ * the region has no IOMMU mapping, and every frame faults: the resulting
++ * interrupt storm starves timer handling and RCU on the big cores. Stop
++ * the DSI stream and the engines and gate the display clock domains
++ * instead; the kernel display driver performs a full cold bring-up.
++ */
++void board_quiesce_devices(void)
++{
++	struct udevice *dsi;
++	void __iomem *mutex = (void __iomem *)DISP_MUTEX_BASE;
++	void __iomem *mmsys = (void __iomem *)MMSYS_BASE;
++	u32 val;
++
++	/*
++	 * Order matters: the kernel's display teardown (mtk_crtc_ddp_hw_fini
++	 * then the encoder disable) stops the DRAM-fetching engines first,
++	 * drains the DSI engine, and gates the MMSYS clock domains last.
++	 * Every engine stop is followed by a bounded idle wait: a clock
++	 * gate applied while an engine still holds an outstanding AXI read
++	 * leaves that request stranded in the SMI/CCI fabric, which wedges
++	 * the interconnect silently for the kernel (deaths at its first
++	 * display domain/clock transition, crash site wandering).
++	 */
++
++	/* Stop the DRAM fetchers (OVL0, OVL0_2L, RDMA0) first. */
++	writel(0, (void __iomem *)DISP_OVL0_BASE + DISP_REG_OVL_EN);
++	writel(0, (void __iomem *)DISP_OVL0_2L_BASE + DISP_REG_OVL_EN);
++	writel(0, (void __iomem *)DISP_RDMA0_BASE + DISP_REG_RDMA_GLOBAL_CON);
++	readl_poll_timeout((void __iomem *)DISP_OVL0_BASE + DISP_REG_OVL_EN,
++			   val, !(val & BIT(0)), 20000);
++	readl_poll_timeout((void __iomem *)DISP_RDMA0_BASE +
++			   DISP_REG_RDMA_GLOBAL_CON, val, !(val & BIT(0)),
++			   20000);
++
++	/* Drain the DSI stream and power the D-PHY down (idle-waits inside). */
++	if (!uclass_get_device(UCLASS_DSI_HOST, 0, &dsi)) {
++		const struct dsi_host_ops *ops = dsi_host_get_ops(dsi);
++
++		if (ops->disable)
++			ops->disable(dsi);
++	}
++
++	/*
++	 * Mask DSI interrupts and clear any status flags left over from
++	 * the boot flow: the Linux driver enables the same interrupt
++	 * sources on its first DSI enable, and a level-triggered status
++	 * inherited from us would fire the IRQ the moment it does.
++	 */
++	writel(0, (void __iomem *)DISP_DSI0_BASE + 0x08);
++	writel(DSI_INT_STA_FLAGS, (void __iomem *)DISP_DSI0_BASE + 0x0c);
++
++	/* Stop the color path, the post-processing blocks and the mutex. */
++	writel(0, (void __iomem *)DISP_COLOR0_BASE + DISP_REG_COLOR_START);
++	writel(0, (void __iomem *)DISP_CCORR0_BASE + DISP_REG_PQ_EN);
++	writel(0, (void __iomem *)DISP_AAL0_BASE + DISP_REG_PQ_EN);
++	writel(0, (void __iomem *)DISP_GAMMA0_BASE + DISP_REG_PQ_EN);
++	writel(0, (void __iomem *)DISP_DITHER0_BASE + DISP_REG_PQ_EN);
++	writel(0, mutex + DISP_REG_MUTEX_EN);
++
++	/* Backlight off; the panel rails stay up for the kernel cold path. */
++	mt8183_disp_disable_backlight();
++
++	/*
++	 * Gate the display clock domains LAST: by now every engine is
++	 * disabled and drained, so gating cannot strand a transaction.
++	 */
++	setbits_le32(mmsys + MMSYS_CG_CON0, CG_CON0_DISP_ALL);
++	setbits_le32(mmsys + MMSYS_CG_CON1, CG_CON1_DISP_DSI0);
++
++	/*
++	 * Stop the hardware watchdog: with CONFIG_WATCHDOG_AUTOSTART=y the
++	 * WDT was armed at initr_watchdog() (60 s requested, clamped to
++	 * ~15.9 s by the MTK driver) and nothing in the EFI ExitBootServices
++	 * path stops it. Handing a running watchdog to the OS can reset the
++	 * machine mid-kernel-boot.
++	 */
++	if (CONFIG_IS_ENABLED(WDT))
++		wdt_stop_all();
++
++	/*
++	 * End ExitBootServices with the CPU in the state the classic Linux
++	 * boot protocol expects (booti/bootm all call cleanup_before_linux()
++	 * before jumping): interrupts off, I/D-caches cleaned and disabled,
++	 * MMU off, TLB invalidated. On arm64 efi_exit_caches() compiles to
++	 * nothing (the GRUB workaround is ARM32-only), so this EFI boot flow
++	 * otherwise hands the kernel a CPU with U-Boot's page tables still
++	 * active and dirty D-cache lines over the payload/initrd/DTB
++	 * regions - the one handoff-state difference from every surviving
++	 * boot chain (depthcharge, kexec hand off with MMU off).
++	 *
++	 * grub continues executing physically after ExitBootServices, which
++	 * is exactly what the arm32 GRUB workaround (the same call under
++	 * CONFIG_EFI_GRUB_ARM32_WORKAROUND) has done for years; the EFI
++	 * stub also re-creates its own identity mapping before touching
++	 * cached data.
++	 */
++	cleanup_before_linux();
++}
++
+-- 
+2.53.0
+
